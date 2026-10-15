@@ -40,6 +40,19 @@ import Link from "next/link";
 import { Network as NetworkIcon, ExternalLink } from "lucide-react";
 import { CrewDiscoveryGraph } from "@/app/franchize/discovery/CrewDiscoveryGraph";
 import type { CrewNetworkModelResult } from "@/app/franchize/discovery/load-network-model";
+import {
+  isNetworkRoleOperator,
+  NETWORK_ROLE_OPERATOR_IDS,
+  networkRoleLabel,
+  type NetworkAssignableRole,
+} from "@/app/franchize/lib/network-role-operators";
+import {
+  assignNetworkCrewRoleAction,
+  listNetworkRoleSnapshotAction,
+  searchNetworkUsersAction,
+  type NetworkRoleSnapshotResult,
+  type SearchNetworkUsersResult,
+} from "@/app/franchize/server-actions/network-role-manager";
 
 /** Segments of the merged single sheet — mirror the bottom nav 1:1.
  *  2026-10-04: + "network" — «Сеть» was the only nav tab hard-navigating
@@ -345,6 +358,283 @@ export function SheetTopPanel({ onRideStopped }: { crew: FranchizeCrewVM; onRide
 // ── «Сеть» segment: the global crew graph inside the deck (2026-10-04) ───────
 
 /**
+ * Роли экипажей — operator-only manager (boss 2026-10-14). Prefabricated
+ * crews ship with I_O_S_NN as the default owner and zero admins; this card
+ * lets the two hardcoded platform operators assign owner / co_owner / admin
+ * on ANY crew straight from the network tab — no SQL editor round-trip.
+ * Target resolves by numeric TG id OR @username; a missing membership row is
+ * created on the fly. Hidden completely for everyone else.
+ */
+function NetworkRoleManager({ nodes }: { nodes: CrewNetworkModelResult["nodes"] }) {
+  const { dbUser } = useAppContext();
+  const actorId = dbUser?.user_id != null ? String(dbUser.user_id) : "";
+  const [open, setOpen] = useState(false);
+  const [slug, setSlug] = useState(nodes[0]?.slug ?? "");
+  const [snapshot, setSnapshot] = useState<NetworkRoleSnapshotResult | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [query, setQuery] = useState("");
+  const [found, setFound] = useState<SearchNetworkUsersResult | null>(null);
+  const [busy, setBusy] = useState(false);
+  /** Two-tap confirm for the 👑 owner transfer — a big move deserves friction:
+   *  first tap arms the button ("Точно?"), second tap within 4s commits. */
+  const [pendingOwner, setPendingOwner] = useState<string | null>(null);
+
+  const load = useCallback(async (crewSlug: string) => {
+    if (!actorId || !crewSlug) return;
+    setLoading(true);
+    try {
+      setSnapshot(await listNetworkRoleSnapshotAction({ slug: crewSlug, actorTelegramUserId: actorId }));
+    } finally {
+      setLoading(false);
+    }
+  }, [actorId]);
+
+  useEffect(() => {
+    if (open && slug) void load(slug);
+  }, [open, slug, load]);
+
+  const assign = useCallback(
+    async (targetQuery: string, role: NetworkAssignableRole) => {
+      if (!actorId || !slug || !targetQuery) return;
+      setBusy(true);
+      setPendingOwner(null);
+      try {
+        const res = await assignNetworkCrewRoleAction({ crewSlug: slug, targetQuery, newRole: role, actorTelegramUserId: actorId });
+        if (res.success) {
+          toast.success(res.message);
+          setQuery("");
+          setFound(null);
+          await load(slug);
+        } else {
+          toast.error(res.error);
+        }
+      } finally {
+        setBusy(false);
+      }
+    },
+    [actorId, slug, load],
+  );
+
+  /** 👑 needs a confirmation tap — arm, then commit (auto-disarm 4s). */
+  const armOwner = useCallback((userId: string) => {
+    setPendingOwner(userId);
+    setTimeout(() => setPendingOwner((prev) => (prev === userId ? null : prev)), 4000);
+  }, []);
+
+  const search = useCallback(async () => {
+    if (!actorId || !query.trim()) return;
+    setBusy(true);
+    try {
+      setFound(await searchNetworkUsersAction({ query, actorTelegramUserId: actorId }));
+    } finally {
+      setBusy(false);
+    }
+  }, [actorId, query]);
+
+  if (!actorId || !isNetworkRoleOperator(actorId)) return null;
+
+  // Prefab crews still owned by a hardcoded operator float to the top of the
+  // selector — they are exactly the ones waiting for a real owner.
+  const crewOptions = nodes
+    .map((n) => ({ slug: n.slug, name: n.name, needsOwner: n.ownerId != null && NETWORK_ROLE_OPERATOR_IDS.has(n.ownerId) }))
+    .sort((a, b) => Number(b.needsOwner) - Number(a.needsOwner) || a.name.localeCompare(b.name, "ru"));
+  const members = snapshot?.success
+    ? [...snapshot.members].sort((a, b) => {
+        const rank = (m: typeof a) => (m.isCrewOwner ? 0 : m.role === "co_owner" ? 1 : m.role === "admin" ? 2 : 3);
+        return rank(a) - rank(b);
+      })
+    : [];
+
+  return (
+    <div className="rounded-2xl border" style={PANEL_CARD}>
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="flex w-full items-center gap-2 px-3 py-2.5 text-left"
+        aria-expanded={open}
+      >
+        <span aria-hidden className="text-[13px]">⚙️</span>
+        <span className="text-xs font-semibold text-[var(--mr-text)]">Роли экипажей</span>
+        <span className="ml-auto text-[10px] font-medium text-[var(--mr-muted)]">
+          {open ? "свернуть" : "операторам"}
+        </span>
+      </button>
+      {open && (
+        <div className="space-y-2.5 border-t px-3 py-3" style={{ borderColor: "var(--mr-border)" }}>
+          <Select value={slug} onValueChange={(v) => { setSlug(v); setSnapshot(null); }}>
+            <SelectTrigger aria-label="Экипаж" className="h-9 border-[var(--mr-border)] bg-transparent text-[var(--mr-text)]">
+              <SelectValue placeholder="Выбери экипаж" />
+            </SelectTrigger>
+            <SelectContent>
+              {crewOptions.map((c) => (
+                <SelectItem key={c.slug} value={c.slug}>
+                  {c.name}
+                  {c.needsOwner ? " · ⚠️ нужен владелец" : " · ✓"}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+
+          {loading && <p className="text-[11px] text-[var(--mr-muted)]">Загружаю состав…</p>}
+
+          {!loading && snapshot && !snapshot.success && (
+            <p className="text-[11px] text-red-400">{snapshot.error}</p>
+          )}
+
+          {!loading && snapshot?.success && (
+            <div className="space-y-1.5">
+              {members.map((m) => {
+                const roleText = m.isCrewOwner ? "Владелец" : m.role ? networkRoleLabel(m.role) : m.membershipStatus === "active" ? "Участник" : m.membershipStatus || "—";
+                const canDemote = !m.isCrewOwner && (m.role === "co_owner" || m.role === "admin");
+                const ownerArmed = pendingOwner === m.userId;
+                return (
+                  <div key={m.userId} className="rounded-xl border px-2.5 py-2" style={PANEL_INSET}>
+                    <div className="flex items-center gap-2">
+                      <div className="min-w-0 flex-1">
+                        <p className="truncate text-[12px] font-semibold text-[var(--mr-text)]">
+                          {m.isCrewOwner ? "👑 " : m.role === "co_owner" ? "🤝 " : m.role === "admin" ? "🛡 " : ""}{m.name}
+                        </p>
+                        <p className="text-[10px] text-[var(--mr-muted)]">
+                          {m.userId}{m.username ? ` · @${String(m.username).replace(/^@/, "")}` : ""} · {roleText}
+                        </p>
+                      </div>
+                      <div className="flex shrink-0 items-center gap-1">
+                        {/* 👑 — two-tap confirm: the transfer moves ownership AND
+                            keeps the previous owner as co_owner (server-side). */}
+                        <button
+                          key="owner"
+                          type="button"
+                          disabled={busy || m.isCrewOwner}
+                          onClick={() => (ownerArmed ? void assign(String(m.userId), "owner") : armOwner(m.userId))}
+                          title={m.isCrewOwner ? "Уже владелец" : ownerArmed ? "Тапни ещё раз — передать владение" : "Назначить владельцем (2 тапа)"}
+                          className={`min-h-7 rounded-lg border px-2 py-1 text-[10px] font-bold transition disabled:opacity-40 ${
+                            ownerArmed
+                              ? "border-amber-400 bg-amber-400/15 text-amber-300"
+                              : m.isCrewOwner
+                                ? "border-[var(--mr-accent)] text-[var(--mr-accent-text)]"
+                                : "border-[var(--mr-border)] text-[var(--mr-muted)] hover:text-[var(--mr-text)]"
+                          }`}
+                        >
+                          {ownerArmed ? "Точно?" : "👑"}
+                        </button>
+                        {(["co_owner", "admin"] as NetworkAssignableRole[]).map((role) => {
+                          const active = m.role === role;
+                          return (
+                            <button
+                              key={role}
+                              type="button"
+                              disabled={busy || active}
+                              onClick={() => void assign(String(m.userId), role)}
+                              title={`Назначить: ${networkRoleLabel(role)}`}
+                              className={`min-h-7 rounded-lg border px-2 py-1 text-[10px] font-bold transition disabled:opacity-45 ${
+                                active
+                                  ? "border-[var(--mr-accent)] text-[var(--mr-accent-text)]"
+                                  : "border-[var(--mr-border)] text-[var(--mr-muted)] hover:text-[var(--mr-text)]"
+                              }`}
+                            >
+                              {role === "co_owner" ? "🤝" : "🛡"}
+                            </button>
+                          );
+                        })}
+                        {/* ➖ — снять роль (demote to plain member); ownership is
+                            guarded server-side (transfer the crown first). */}
+                        {canDemote && (
+                          <button
+                            key="demote"
+                            type="button"
+                            disabled={busy}
+                            onClick={() => void assign(String(m.userId), "member")}
+                            title="Снять роль — станет участником"
+                            className="min-h-7 rounded-lg border border-[var(--mr-border)] px-2 py-1 text-[10px] font-bold text-[var(--mr-muted)] transition hover:text-red-300 disabled:opacity-45"
+                          >
+                            ➖
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+          {/* Add / promote by id or username — covers «future owner is not a member yet». */}
+          <form
+            className="space-y-1.5 rounded-xl border p-2.5"
+            style={PANEL_INSET}
+            onSubmit={(event) => {
+              event.preventDefault();
+              void search();
+            }}
+          >
+            <p className="text-[10px] font-semibold uppercase tracking-wide text-[var(--mr-muted)]">
+              Добавить по Telegram ID / @username
+            </p>
+            <div className="flex items-center gap-1.5">
+              <Input
+                value={query}
+                onChange={(event) => setQuery(event.target.value)}
+                placeholder="@username или 123456789"
+                className="h-8 border-[var(--mr-border)] bg-transparent text-[12px] text-[var(--mr-text)]"
+              />
+              <Button type="submit" size="sm" variant="outline" disabled={busy || !query.trim()} className="h-8 shrink-0 px-2 text-[11px]">
+                Найти
+              </Button>
+            </div>
+            {found?.success && found.users.length > 0 && (
+              <div className="space-y-1">
+                {found.users.map((u) => (
+                  <div key={u.userId} className="flex items-center gap-1.5 rounded-lg border px-2 py-1.5" style={{ borderColor: "var(--mr-border)" }}>
+                    <span className="min-w-0 flex-1 truncate text-[11px] text-[var(--mr-text)]">{u.name}</span>
+                    {(["owner", "co_owner", "admin"] as NetworkAssignableRole[]).map((role) =>
+                      role === "owner" ? (
+                        <button
+                          key={role}
+                          type="button"
+                          disabled={busy}
+                          onClick={() => (pendingOwner === u.userId ? void assign(u.userId, role) : armOwner(u.userId))}
+                          className={`min-h-7 rounded-lg border px-1.5 py-0.5 text-[10px] font-bold transition disabled:opacity-45 ${
+                            pendingOwner === u.userId
+                              ? "border-amber-400 bg-amber-400/15 text-amber-300"
+                              : "border-[var(--mr-border)] text-[var(--mr-muted)] hover:text-[var(--mr-text)]"
+                          }`}
+                        >
+                          {pendingOwner === u.userId ? "Точно?" : "👑"}
+                        </button>
+                      ) : (
+                        <button
+                          key={role}
+                          type="button"
+                          disabled={busy}
+                          onClick={() => void assign(u.userId, role)}
+                          className="min-h-7 rounded-lg border border-[var(--mr-border)] px-1.5 py-0.5 text-[10px] font-bold text-[var(--mr-muted)] transition hover:text-[var(--mr-text)] disabled:opacity-45"
+                        >
+                          {role === "co_owner" ? "🤝" : "🛡"}
+                        </button>
+                      ),
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+            {found?.success && found.users.length === 0 && (
+              <p className="text-[11px] text-[var(--mr-muted)]">Никого не нашёл — проверь написание.</p>
+            )}
+            {found && !found.success && <p className="text-[11px] text-red-400">{found.error}</p>}
+          </form>
+
+          <p className="text-[10px] leading-relaxed text-[var(--mr-muted)]">
+            👑 владелец · 🤝 совладелец · 🛡 админ · ➖ снять роль. Назначение сразу создаёт участие,
+            если человека ещё нет в экипаже. Передача владения — прошлый владелец остаётся
+            совладельцем. Граф обновится при следующей загрузке сети.
+          </p>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
  * The «Сеть экипажей» discovery graph, embedded in the sheet. The model
  * arrives as plain props from the map-riders server page (same loader as
  * the /franchize/discovery page); the graph itself is the SAME component
@@ -400,6 +690,8 @@ export function SheetNetworkPanel({ network }: { network: CrewNetworkModelResult
         bloggerLinks={network.bloggerLinks}
         variant="sheet"
       />
+      {/* Operator-only: assign owner/co_owner/admin on prefab crews right here. */}
+      <NetworkRoleManager nodes={network.nodes} />
     </div>
   );
 }
