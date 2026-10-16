@@ -381,7 +381,12 @@ export async function calculateSalaryForPeriod(params: {
     // NOTE: cacheKey must be constructed AFTER `useRateCalculation` is
     // determined, otherwise referencing the const here triggers a
     // Temporal Dead Zone ReferenceError.
-    const cacheKey = `${access.crewId}-${memberId}-${periodStart}-${periodEnd}-${useRateCalculation}-${useCategoryModel}`;
+    // Task 98: v98 suffix — the bucket-fix changed breakdown/totals; the old
+    // 24h cache entries must not serve pre-fix numbers to warm instances.
+    // Task 100: v100 — Paul's October normalize SQL (500 ₽/h → 100 ₽/h with
+    // explicit salary_amount recompute) changes stored shift pay; warm 24h
+    // caches must not keep serving the pre-normalize numbers.
+    const cacheKey = `${access.crewId}-${memberId}-${periodStart}-${periodEnd}-${useRateCalculation}-${useCategoryModel}-v100`;
     const cached = salaryCalcCache.get(cacheKey);
     if (cached && cached.expiry > Date.now()) {
       logger.debug("[calculateSalaryForPeriod] Cache hit", { cacheKey, useRateCalculation });
@@ -436,6 +441,7 @@ export async function calculateSalaryForPeriod(params: {
 
     // Priority 1 Fix 3: Use calculated OR recorded commissions, not both
     let commissionIncome = 0;
+    let commissionItems: { rentals: unknown[]; sales: unknown[] } | undefined;
     const breakdown: Array<{ type: string; amount: number; description: string }> = [];
     breakdown.push({ type: "shifts", amount: shiftIncome, description: "Смены" });
 
@@ -450,6 +456,8 @@ export async function calculateSalaryForPeriod(params: {
       });
       commissionIncome += categoryResult.total;
       breakdown.push(...categoryResult.details);
+      // Task 98: per-rental/per-sale rows for the docx report detail tables.
+      commissionItems = { rentals: categoryResult.rentalItems, sales: categoryResult.saleItems };
     }
 
     if (useRateCalculation && commissionRates && commissionRates.length > 0) {
@@ -559,6 +567,7 @@ export async function calculateSalaryForPeriod(params: {
       bonusIncome: 0,
       totalIncome,
       breakdown,
+      commissionItems,
     };
 
     // Кэшируем результат на 24 часа — но НЕ если there's an active (in-progress)

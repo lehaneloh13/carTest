@@ -22,7 +22,7 @@ import { hasSalaryCoefficients } from "@/lib/salary-coefficients";
 // with calculateSalaryForPeriod — so «Мои доходы», «Зарплаты команды» and
 // the owner overview show the SAME picture as the /salary breakdown for
 // category-model crews (rentals/sales attributed to the operator).
-import { computeCategoryBonuses } from "@/app/franchize/lib/salary-category-bonuses";
+import { computeCategoryBonuses, type CategoryBonusRentalItem, type CategoryBonusSaleItem } from "@/app/franchize/lib/salary-category-bonuses";
 
 /**
  * Get team members' earnings for a period.
@@ -36,6 +36,9 @@ export async function getTeamEarnings(params: {
 }): Promise<ActionResponse<Array<{
   memberId: string;
   memberName: string;
+  // Task 100: the Telegram full name (when it differs from memberName) —
+  // the UI shows it as a muted secondary line under the @username.
+  memberFullName?: string | null;
   shifts: number;
   shiftIncome: number;
   commissionIncome: number;
@@ -121,12 +124,18 @@ export async function getTeamEarnings(params: {
         // fallback checked, but production users have those undefined —
         // so the salary page was showing "Member <id-slice>" placeholders
         // instead of actual nicknames.
+        // Task 100: @username FIRST — the crew identifies people by their
+        // Telegram handles (same labels the CSV attribution columns use).
+        // full_name alone produced warts like "Dmitry User" for @djorudjov
+        // (his Telegram last_name is literally "User"). full_name is still
+        // returned as memberFullName for the muted secondary line.
         const memberName =
+          (member.users?.username && `@${member.users.username}`) ||
           member.users?.full_name ||
-          member.users?.username ||
           metadata?.name ||
           metadata?.username ||
           `Member ${memberId.slice(0, 6)}`;
+        const memberFullName = member.users?.full_name || null;
 
         // Get shifts for period — filter by crew_id too, otherwise shifts
         // from another crew the member belongs to would leak in.
@@ -178,6 +187,7 @@ export async function getTeamEarnings(params: {
         return {
           memberId,
           memberName,
+          memberFullName,
           shifts: Math.round(shiftHours * 10) / 10,
           shiftIncome: Math.round(shiftIncome),
           commissionIncome: Math.round(commissionIncome),
@@ -192,6 +202,20 @@ export async function getTeamEarnings(params: {
     return errorResponse(handleError(err, "getTeamEarnings"));
   }
 }
+
+/**
+ * Task 98: TL;DR rows for the profile «Мои доходы» panel — per-rental /
+ * per-sale bonus lines with equipment flags, the ₽ split and operator roles
+ * (names resolved from ids in ONE batched users lookup).
+ */
+export type EarningsRentalItem = Omit<CategoryBonusRentalItem, "createdByChatId" | "handedByChatId" | "returnedByChatId"> & {
+  createdByLabel: string;
+  handedByLabel: string;
+  returnedByLabel: string;
+};
+export type EarningsSaleItem = Omit<CategoryBonusSaleItem, "createdByChatId"> & {
+  createdByLabel: string;
+};
 
 /**
  * Get member's own earnings for a period.
@@ -209,6 +233,7 @@ export async function getMemberEarnings(params: {
   commissionIncome: number;
   total: number;
   breakdown: Array<{ date: string; description: string; amount: number }>;
+  commissionItems?: { rentals: EarningsRentalItem[]; sales: EarningsSaleItem[] };
 }>> {
   const { slug, from, to, memberId } = params;
 
@@ -289,6 +314,7 @@ export async function getMemberEarnings(params: {
     // instead, so the member sees WHICH rentals/sales paid the bonuses.
     const useCategoryModel = await hasSalaryCoefficients(crewId);
     let commissionIncome = 0;
+    let commissionItems: { rentals: EarningsRentalItem[]; sales: EarningsSaleItem[] } | undefined;
     if (useCategoryModel) {
       try {
         const bonuses = await computeCategoryBonuses({
@@ -305,6 +331,45 @@ export async function getMemberEarnings(params: {
             amount: d.amount,
           });
         }
+
+        // Task 98: resolve operator ids → readable labels (@username first)
+        // in ONE batched users query — the TL;DR lists show who created /
+        // handed out / returned each rental (multi-operator transparency).
+        const operatorIds = new Set<string>();
+        for (const it of bonuses.rentalItems) {
+          for (const id of [it.createdByChatId, it.handedByChatId, it.returnedByChatId]) {
+            if (id) operatorIds.add(id);
+          }
+        }
+        for (const it of bonuses.saleItems) {
+          if (it.createdByChatId) operatorIds.add(it.createdByChatId);
+        }
+        const operatorLabel = new Map<string, string>();
+        if (operatorIds.size > 0) {
+          const { data: opUsers } = await supabaseAdmin
+            .from("users")
+            .select("user_id, username, full_name")
+            .in("user_id", Array.from(operatorIds));
+          for (const u of (opUsers || []) as Array<{ user_id: string; username: string | null; full_name: string | null }>) {
+            operatorLabel.set(
+              String(u.user_id),
+              u.username ? `@${u.username}` : u.full_name?.trim() || String(u.user_id),
+            );
+          }
+        }
+        const labelOf = (id: string | null): string => (id ? operatorLabel.get(id) || id : "");
+        commissionItems = {
+          rentals: bonuses.rentalItems.map((it) => ({
+            ...it,
+            createdByLabel: labelOf(it.createdByChatId),
+            handedByLabel: labelOf(it.handedByChatId),
+            returnedByLabel: labelOf(it.returnedByChatId),
+          })),
+          sales: bonuses.saleItems.map((it) => ({
+            ...it,
+            createdByLabel: labelOf(it.createdByChatId),
+          })),
+        };
       } catch (bonusErr) {
         logger.warn("[getMemberEarnings] category bonuses failed:", bonusErr);
       }
@@ -346,6 +411,7 @@ export async function getMemberEarnings(params: {
         ...b,
         amount: Math.round(b.amount),
       })),
+      commissionItems,
     });
   } catch (err) {
     logger.error("[getMemberEarnings] Exception:", err);
@@ -375,6 +441,8 @@ export async function getOwnerSalaryOverview(params: {
 }): Promise<ActionResponse<Array<{
   memberId: string;
   memberName: string;
+  // Task 100: Telegram full name for the muted secondary line (may be null).
+  memberFullName?: string | null;
   role: string;
   periodStart: string;
   periodEnd: string;
@@ -464,12 +532,15 @@ export async function getOwnerSalaryOverview(params: {
         // fallback checked, but production users have those undefined —
         // so the salary page was showing "Member <id-slice>" placeholders
         // instead of actual nicknames.
+        // Task 100: @username first — same rule as getTeamEarnings, so the
+        // /salary overview and the profile leaderboard show the same handle.
         const memberName =
+          (member.users?.username && `@${member.users.username}`) ||
           member.users?.full_name ||
-          member.users?.username ||
           metadata?.name ||
           metadata?.username ||
           `Member ${memberId.slice(0, 6)}`;
+        const memberFullName = member.users?.full_name || null;
         const role = member.role || "member";
 
         // Shifts for period — crew-scoped to prevent multi-crew leak.
@@ -533,6 +604,7 @@ export async function getOwnerSalaryOverview(params: {
         return {
           memberId,
           memberName,
+          memberFullName,
           role,
           periodStart: periodStartIso,
           periodEnd: periodEndIso,
