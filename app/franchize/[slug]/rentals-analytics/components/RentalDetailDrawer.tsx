@@ -100,6 +100,19 @@ interface RentalDetailDrawerProps {
    *  Optional to keep every existing call site compiling; when absent the
    *  deposit fetch falls back to the metadata-only view (old behavior). */
   crewSlug?: string;
+  // ── Task 103: on-the-fly verification affordance ──
+  /** Viewer passes the owner-tier gate (owner/admin/co_owner) — shows the
+   *  manual «✓ подтвердить сверку» / «✓ закрыть спор» button for COMPLETED
+   *  rentals that are not verified yet (incl. the backfill case with no row).
+   *  The server action re-checks the role and funnels through the same
+   *  state machine as the Telegram buttons. */
+  canVerify?: boolean;
+  /** Verify request in flight (parent-owned so the whole tree stays consistent). */
+  verifyPending?: boolean;
+  /** Last attempt failed — inline «✕ не сохранилось» flag (never silent). */
+  verifyFailed?: boolean;
+  /** Trigger the owner-side manual confirm. */
+  onVerifyRental?: () => void;
 }
 
 type TodoFilter = "all" | "mine" | "overdue";
@@ -139,6 +152,10 @@ export function RentalDetailDrawer({
   T,
   asSheetChild = false,
   crewSlug,
+  canVerify = false,
+  verifyPending = false,
+  verifyFailed = false,
+  onVerifyRental,
 }: RentalDetailDrawerProps) {
   const [todoFilter, setTodoFilter] = useState<TodoFilter>("all");
   const [newNote, setNewNote] = useState("");
@@ -176,6 +193,20 @@ export function RentalDetailDrawer({
   useEffect(() => { void loadDepositSummary(); }, [loadDepositSummary]);
 
   const statusMeta = getRentalStatusMeta(rental.status);
+  // Task 102: verification chip — same mapping as AnalyticsRentalCard.
+  const ver = rental.verificationStatus ?? null;
+  const verMeta =
+    ver === "verified"
+      ? { color: "#22c55e", label: "✅ сверена" }
+      : ver === "disputed"
+        ? { color: "#ef4444", label: "⚠️ спор сверки" }
+        : ver === "operator_confirmed"
+          ? { color: "#f59e0b", label: "⏳ ждёт владельца" }
+          : ver === "owner_confirmed"
+            ? { color: "#f59e0b", label: "⏳ ждёт оператора" }
+            : ver === "pending"
+              ? { color: "#f59e0b", label: "⏳ сверка" }
+              : null;
   const bikeTitle = getRentalBikeTitle(rental);
   // iter32: gear rentals get their subject from the gear snapshot —
   // «Шлем LS2», «Шлем + ещё 2» instead of a fake bike title.
@@ -381,6 +412,47 @@ export function RentalDetailDrawer({
               >
                 {formatRubles(cost)}
               </span>
+              {/* Task 102: operator+owner commission verification chip — the
+                  money-reconciliation state, same semantics as the card. */}
+              {verMeta && (
+                <span
+                  className="rounded-full px-3 py-1 text-[11px] font-medium"
+                  style={{ background: `${verMeta.color}1a`, color: verMeta.color }}
+                  title="Сверка расчёта: оператор + владелец подтверждают комиссию сразу после закрытия аренды"
+                >
+                  {verMeta.label}
+                </span>
+              )}
+              {/* Task 103: owner-tier manual confirm — closes the loop from the
+                  analytics page (backfill of pre-feature rentals, dispute
+                  resolution after an offline talk). Completed rentals only,
+                  verified rows excluded; server action re-gates the role. */}
+              {canVerify && rental.status === "completed" && ver !== "verified" && onVerifyRental && (
+                verifyFailed ? (
+                  <span
+                    className="rounded-full px-3 py-1 text-[11px] font-semibold"
+                    style={{ background: "#ef44441a", color: "#ef4444" }}
+                    title="Не удалось сохранить подтверждение — попробуйте ещё раз"
+                  >
+                    ✕ не сохранилось
+                  </span>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={onVerifyRental}
+                    disabled={verifyPending}
+                    className="cursor-pointer rounded-full px-3 py-1 text-[11px] font-semibold transition focus:outline-none focus-visible:ring-2 disabled:cursor-wait disabled:opacity-50"
+                    style={{ background: "#22c55e1f", color: "#22c55e" }}
+                    title={
+                      ver === "disputed"
+                        ? "Закрыть спор после личного разбора — обе стороны получат отметку «проверено»"
+                        : "Подтвердить расчёт вручную (после личной сверки с оператором)"
+                    }
+                  >
+                    {verifyPending ? "…" : ver === "disputed" ? "✓ закрыть спор" : "✓ подтвердить сверку"}
+                  </button>
+                )
+              )}
             </div>
           </div>
         </div>
