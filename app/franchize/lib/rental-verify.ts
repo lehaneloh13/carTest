@@ -228,7 +228,7 @@ export async function computeRentalVerificationSnapshot(params: {
 // ── Graceful table access ────────────────────────────────────────────────────
 
 /** True when the failure is «Paul hasn't applied the SQL yet» — feature no-ops. */
-function isMissingRelationError(error: { message?: string; code?: string } | null | undefined): boolean {
+export function isMissingRelationError(error: { message?: string; code?: string } | null | undefined): boolean {
   if (!error) return false;
   if (error.code === "42P01") return true; // undefined_table
   return /relation .* does not exist|schema cache/i.test(error.message || "");
@@ -440,7 +440,7 @@ export async function requestRentalVerification(params: {
 
 // ── Callback handling (Telegram buttons) ─────────────────────────────────────
 
-async function answerCallback(callbackQueryId: string, text: string): Promise<void> {
+export async function answerCallback(callbackQueryId: string, text: string): Promise<void> {
   try {
     const token = process.env.TELEGRAM_BOT_TOKEN;
     if (!token) return;
@@ -605,9 +605,12 @@ export async function handleRentalVerifyCallback(params: {
             acceptorLabel: labelFromUsersMap(usersMap, agreedNego.agreed.acceptedBy),
           })
         : doneText;
+      // Task 107: every «verified» DM now carries the payout-hub entry —
+      // the money game continues after the confirm (see the payout counter).
+      const payoutDoneKb = [[{ text: "💰 Мои выплаты", callback_data: "payo_hub_0" }]];
       for (const chatId of [...new Set([current.operator_chat_id, current.owner_chat_id].filter(Boolean) as string[])]) {
         try {
-          await sendComplexMessage(chatId, doneFinal, [], { parseMode: "HTML" });
+          await sendComplexMessage(chatId, doneFinal, payoutDoneKb, { parseMode: "HTML", keyboardType: "inline" });
         } catch {
           /* non-fatal */
         }
@@ -673,7 +676,7 @@ export async function handleRentalVerifyCallback(params: {
 // negotiation jsonb only carries the DRAFT / OPEN proposal / AGREED split.
 
 /** True editMessageText (the shared editMessage deletes+resends — flickers). */
-async function editTelegramMessageText(
+export async function editTelegramMessageText(
   chatId: string | number,
   messageId: number,
   text: string,
@@ -885,15 +888,30 @@ export async function handleRentalVerifyProposalCallback(params: {
         if (!(await saveNego(nego))) return true;
         // Switch the chat into capture mode: the next plain text message
         // becomes the comment (hook in command-handler.ts → handleRentalVerifyCommentText).
-        await supabaseAdmin.from("user_states").upsert(
+        // NB task110: user_states has NO `updated_at` column (live table comes
+        // from 20250721100000_create_user_states_table.sql: user_id/state/context/
+        // expires_at/created_at only). Writing `updated_at` made PostgREST reject
+        // the whole upsert (42703/PGRST204) and supabase-js does NOT throw on API
+        // errors — the state silently never existed, the next text message fell
+        // through every handler and the operator got «Неизвестная команда».
+        // Payload mirrors doc/subrent setState; expires_at set explicitly (the
+        // on-conflict update would otherwise keep a stale 15-min default).
+        const { error: stateErr } = await supabaseAdmin.from("user_states").upsert(
           {
             user_id: chatId,
             state: `vrf_comment_${rentalId}`,
             context: { editorMessageId: params.messageId ?? null },
-            updated_at: new Date().toISOString(),
+            expires_at: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
           },
           { onConflict: "user_id" },
         );
+        if (stateErr) {
+          // Loud failure instead of a fake prompt: the capture hook would
+          // never fire and the next message would die in the router.
+          logger.error("[rental-verify] vrf_comment state upsert failed:", stateErr.message);
+          await answerCallback(params.callbackQueryId, "⚠️ Не удалось включить режим ввода. Попробуйте ещё раз.");
+          return true;
+        }
         await answerCallback(params.callbackQueryId, "Напишите комментарий следующим сообщением");
         await renderEditorMessage(chatId, params.messageId, [
           `✍️ <b>Комментарий к предложению</b>`,
@@ -1018,7 +1036,10 @@ export async function handleRentalVerifyProposalCallback(params: {
           });
           for (const c of [...new Set([current.operator_chat_id, current.owner_chat_id].filter(Boolean) as string[])]) {
             try {
-              await sendComplexMessage(c, done, [], { parseMode: "HTML" });
+              await sendComplexMessage(c, done, [[{ text: "💰 Мои выплаты", callback_data: "payo_hub_0" }]], {
+                parseMode: "HTML",
+                keyboardType: "inline",
+              });
             } catch {
               /* non-fatal */
             }
@@ -1123,12 +1144,19 @@ export async function handleRentalVerifyCommentText(params: {
   text: string;
 }): Promise<boolean> {
   try {
-    const { data: stateRow } = await supabaseAdmin
+    const { data: stateRow, error: stateReadErr } = await supabaseAdmin
       .from("user_states")
       .select("state, context")
       .eq("user_id", params.userId)
       .like("state", "vrf_comment_%")
       .maybeSingle();
+    if (stateReadErr) {
+      // NB task110: a transient read error must not push the operator's next
+      // message into the generic router (that produced «Неизвестная команда»).
+      // Missing table → fall through (degradation), any other blip → consume.
+      logger.warn("[rental-verify] vrf_comment state read failed:", stateReadErr.message);
+      return !isMissingRelationError(stateReadErr);
+    }
     if (!stateRow?.state) return false;
     const rentalId = String(stateRow.state).slice("vrf_comment_".length);
     const text = String(params.text || "").trim();

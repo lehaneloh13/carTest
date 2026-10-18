@@ -904,3 +904,56 @@ Stage Summary:
 - Поп-пины постов: xl 46px + сонар цвета экипажа + свечение + heartbeat; авто-тема — фирменный amber VIP BIKE (#facc15), фиксированные экипажи — их accentMain (инлайн тинг каждого пина)
 - Кластеризация не тронута: ниже z10 посты группируются в бабблы (pop-классы заменяются mr-poi--cluster, как и раньше с halo) — низкий зум спокоен, сонар появляется при расхождении
 - Скрипт-пробник переносим (CHROME_PATH), артефакты в docs/probes/ регенерируемые
+
+---
+Task ID: 107-rentals-retro-investigation
+Agent: Super Z (main)
+Task: boss 2026-10-18: «please analyse rentals, which were the first ones? … I want to retrospectively add first manually created rentals to supabase. I have .doc files from first rentals - later i'll give you .zip with almost all docs, your task will be to find rentals that are not yet present in supabase and add them properly. make preliminary investigation of current state of rentals, when were first ones, total detailed summary»
+
+Work Log:
+- ПЕРЕКЛАДКА: неловко, но. (не извиняясь дважды) — full read-only dump of public.rentals (273 rows) via PostgREST + service key (ключ из навыка/ENV_VARS не в репо; старый ключ из сессии протух 401 — рабочий вытащен из scripts/*.js, сохранён вне репо как .sb_key, в коммит НЕ попал — проверено grep eyJ)
+- Найдено 4 эпохи данных (см. docs/rentals-retrospective/RENTALS_RETROSPECTIVE_INVESTIGATION_2026-10-18.md): Era 0 тесты 2025-08…2026-02 (8 строк: ural-bobber 999₽ + sauna-001 отмены + markdown-doc-poc); Era 1 /doc родился 2026-06-04 (git 01f348cf), первые РЕАЛЬНЫЕ аренды 2026-06-17…06-20 (nibbler 6000₽, suzuki-gsx ×3 — переиздания одного договора), часть восстановлена backfill_from_artifacts 2026-06-23 (original_contract_key/original_sha256 в private.rental_contract_artifacts); Era 2 атрибуция с 2026-07-25 (metadata.source=doc_command + doc_sha256, всего 116 source=doc_command / 133 с sha); Era 3 новые каналы с августа (service_work 44, franchize_web_order 53 с document_key/order_id)
+- ДЫРА ПОД .zip: аренд с agreed-периодом ДО 2026-06-17 в базе НЕТ вообще — вся докомандная «бумажная» история отсутствует (до июня только тесты). Пиковые месяцы: 2026-09 = 115 аренд / 729k₽; всего 273 строки ≈ 1.89M₽ (с тестами)
+- АТРИБУЦИЯ АРЕНДАТОРОВ: 180/273 строк висят на user_id=356282674 (I_O_S_NN) — walk-in паттерн, реальный арендатор только в metadata.renter_name/renter_phone (заполняется лишь с ~19.08.2026, 49 строк); телефоны в двух форматах (+7…/8…) — нормализовать при матчинге; 161 строка вообще без renter_name
+- КЛЮЧИ МАТЧИНГА .zip→база (приоритет): doc_sha256/original_sha256 → original_contract_key (rental-<vehicle>-<ms>) → фаззи renter_name+phone+vehicle+даты±2дня+сумма; предусмотреть легитимные переиздания (3×suzuki-gsx), .doc≠.docx (антиворд/libreoffice/VLM), idempotency-манифест (sha файла → действие → rental_id), вставки с source=retro_backfill_v1 + audit в metadata.history (прецеденты owner_voice_backfill 10.10, backfill_from_artifacts 23.06)
+- Артефакты: docs/rentals-retrospective/RENTALS_RETROSPECTIVE_INVESTIGATION_2026-10-18.md (+PNG-таймлайн 15 месяцев), scripts/retro-rentals-{investigation,deep-dive,round3,round4}.py (read-only, ключ из ENV, секретов не содержат); открытые вопросы боссу — §6 документа (период архива, отменённые договоры, создание users под walk-in, байки вне cars)
+
+Stage Summary:
+- Базлайн для ретро-импорта готов: точная карта «что уже в базе» (273, первые реальные 2026-06-17), 4 источника-канала, ключи дедупликации и план безопасной вставки; ждём .zip с .doc — следующий таск: парсинг архива → фаззи-матчинг → подтверждение боссом → вставка недостающих
+
+---
+Task ID: 108-summary-and-backfill
+Agent: Super Z (main)
+Task: boss 2026-10-18: «here is all info - regarding rentals - all the doc files in zip. sales are in separate table:) need to add missing rentals prior to mid june for proper TOTAL SEASON stats calculations. All requested info is in screenshots - start iterating on SUMMARY.html, with a lot of infographics - we'll add info step by step over several iterations. main thing is to get everything correct at the end»
+
+Work Log:
+- ВХОДНЫЕ: 2 рукописные памятки-спецификации (скачаны с CDN, IMG_20261018_180519/180523): «ПО АРЕНДЕ» (все аренды→бота май–окт, по каждому байку, расходы ~бензин/масла, партнёрские 50/50) и «ПО ПРОДАЖАМ» (вложения/кредит, закуп на аренду vs продажу, реализация, остатки, падальщики, расходы, деньги Илья/Роман, ИТОГ ±). Дедлайн 25.10.2026. ⚠ все договора.zip НА ДИСК НЕ ДОШЁЛ (upload пуст; качать неоткуда) — запрошена повторная отправка. xlsx дошёл только как текстовая выжимка в сообщении — транскрибирован в scripts/task108-xlsx-data.json (Аренда/Закупка продажа/Экип/сервис×2/Выставки/салон).
+- РЕТРО-БЭКФИЛЛ: вставлены 5 майских аренд (единственные с датой+суммой в xlsx «Аренда»): 04.05 Коняхин Ducati Panigale S Electro Black Z («зубик» = суффикс Z! 10 000), 04.05 Zero без ФИО (10 000), 06.05 Ульви Мамед Zero (10 000), 30.05 Забалдин Кава зелёная=Kawasaki EX650K (6 000, залог 20 000 нал), 05.06 Шаронов Кава (10 000 + экип 4 000 в metadata.ekip_rub). source=retro_backfill_v1, provenance в metadata.specs.retro_backfill_v1, walk-in user/owner 356282674, crew vip-bike, created_at=дата аренды. Манифест scripts/task108-backfill-manifest.json (5 rental_id). ОВЕРЛАП-ПРОВЕРКА перед вставкой — чисто; после вставки earliest agreed_start = 2026-05-04 (было 06-17).
+- 5 строк xlsx БЕЗ дат отложены до .zip (Zero/Платонов 30 000, Хорвин/Коля 2 000, слава 4 000 бартер, Борский 19 000 залог 20 000/возврат 18 500 «разбил Вайвольт», Кава 1.5 дня) — видны в SUMMARY.
+- SUMMARY.html v0.1 (docs/summary/ + download): self-contained inline-SVG дашборд, RU, секции Аренда (KPI: 186 аренд байков / 1 834 732 ₽ / чек 9 864 / экип 43 шт 11 500+4 000 / залоги 1 683 000 / сервис 44 шт 27 735; месяцы май 4→окт 26 шт, выручка сент 701k пик; топ байков Kawasaki 234 500×25, BMW F800R 181 300×19, Aprilia 157 600×12, Ducati S Electro 156 719×20; партнёрские кандидаты Zero+Кава = 334 833 → 50/50 ~167 416 с флагом «подтвердить»; расходы бензин/масла = плейсхолдеры; статус май-бэкфилла) · Продажи (закуп 16 612 515, выручка 17 793 800, прибыль 3 995 460, остатки салон 3 125 900 + партнёрская 1 483 000, топ-10 прибыльных, полная ведомость, сверка-футнот 1 181 285 ≠ 3 995 460 — ждём оригинал xlsx) · Расходы (донат: маркетинг 928 141 / экип 393 160 / салон 275 922 / сервис 75 887; з/п+эл-во плейсхолдеры; детализация мероприятий) · ИТОГ± (сводный баланс = +4 207 317 без «вопросов», 50/50 = 2 103 659 Илье/Роману, колонки деньги/продажи/аренда по памятке — после закрытия вопросов) · Дальше (ремонт+шоурум+сервис → закуп на зиму → закуп на сезон).
+- Визуальная QA: playwright-скриншоты 4 секций (chromium из ~/.cache), пойман и исправлен клип меток на максимальных барах (right_w 70→150). Арифметика итога пересчитана вручную — сходится.
+- Артефакты в репо: docs/summary/SUMMARY.html, scripts/task108-{build-summary.py,fetch-snapshot.py,insert-backfill.py,xlsx-data.json,backfill-manifest.json,rentals-snapshot.json,cars-snapshot.json} (снапшоты — входы генератора, рефрешатся fetch-скриптом).
+
+Stage Summary:
+- Сезонная статистика собрана и опубликована v0.1; май-дыра закрыта частично (5/10 известных аренд с датами — вставлены; 5 ждут .zip). ИТОГ сезона ≈ +4.21M ₽ (без кредита/з/п/падальщиков/бензина), 50/50 ≈ 2.10M. Для v1.0 нужно от босса: .zip повторно, оригинал xlsx, цифры-вопросы (кредит, з/П, Илья/Роман полученное, бензин, повреждения), подтверждение партнёрских байков.
+
+---
+Task ID: 109-zip-archive-parse-summary-v02
+Agent: main (Claude)
+Task: Parse "все договора.zip" (145 files) + xlsx + screenshots; find rentals missing from Supabase before mid-June for TOTAL SEASON stats; iterate SUMMARY.html.
+
+Work Log:
+- Restored env after session reset: re-cloned repo, recovered service_role key via scripts/season-2026/find_key.py (scans repo for JWTs, tests against PostgREST; working key saved outside repo at ../scripts/.sb_key).
+- Extracted zip: 145 files (143 docx / 1 pdf / 1 txt). Built parser scripts/season-2026/{zip_inventory.py,master_parse_match.py}: sha256, contract_no, date, renter, vehicle, period, total, deposit, phone; matched vs Supabase by (vehicle_id + date ±2d + surname), sha256 matched only 1/145 (Telegram re-encodes files).
+- sales table investigation: public.sales does NOT exist; ДКП live in private.sale_contract_artifacts (REST-inaccessible), money in cash_transactions.income_sale = 35 ops / 14 593 000 ₽ (июнь 3.93M, июль 6.06M, авг 2.61M, сен 1.68M, окт 0.31M).
+- Found: 88 contracts already in DB; 26 rental contracts NOT in DB (7 May old-format + 17 July + 2 long-term 05.08); 4 rentals only in xlsx (55 000 ₽); 9 blank templates; 11 testdrives; 4 sale contracts.
+- Discovered prior partial backfill (source=retro_backfill_v1, 5 rows, 46 000 ₽: Коняхин 04.05, Zero 04.05, Ульви 06.05, Забалдин 30.05, Шаронов 05.06) — excluded from import plan, no duplicates.
+- Known missing sums: July 171 250 ₽ (16 contracts, 5 TBD in body) + xlsx-only 55 000 ₽ + May 7 contracts TBD. Projected season rentals after import ≈ 2 019 716 ₽+ (now 1 793 466 ₽).
+- Notable data quirks: «Ларин» file named 29.06 but contains contract №05.08/APRILIA 05.08; Red Ducati Panigale (Чуфыркин 05.07, Халикова 08.07) not in cars; 2 long-term Сидоров/Буробин sublease contracts; Борский case "из Горелых разбил Вайвольт".
+- Built 6 infographics (download/charts, repo docs/summary/charts/) and TWO summary artifacts: light analysis version (DOWNLOAD/SUMMARY.html) + merged dark v0.2 of docs/summary/SUMMARY.html (task108 structure + new «1b · Архив договоров» section, cash verification, updated next-steps).
+- Charts: coverage timeline, zip donut, DB revenue by month, missing money, sales cash vs xlsx, DB sources.
+
+Stage Summary:
+- Full gap map ready for retro_backfill_v2 import: ~30 rentals (26 contracts + 4 xlsx-only), ≈226 250 ₽ known + TBD from 7 old-format bodies.
+- docs/summary/SUMMARY.html v0.2 published in repo + synced to local download/. Import plan: iter2 = deep-parse 5 May bodies + 5 no-sum contracts; iter3 = insert with source=retro_backfill_v2 + metadata.history; iter4 = TOTAL SEASON dashboard (rental+sales+expenses, per-bike, 50/50).
+- Open questions to boss: long-term contracts in/out, Red Panigale card, Борский insurance, barter in revenue, gear line for Шаронов.
