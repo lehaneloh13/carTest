@@ -957,3 +957,43 @@ Stage Summary:
 - Full gap map ready for retro_backfill_v2 import: ~30 rentals (26 contracts + 4 xlsx-only), ≈226 250 ₽ known + TBD from 7 old-format bodies.
 - docs/summary/SUMMARY.html v0.2 published in repo + synced to local download/. Import plan: iter2 = deep-parse 5 May bodies + 5 no-sum contracts; iter3 = insert with source=retro_backfill_v2 + metadata.history; iter4 = TOTAL SEASON dashboard (rental+sales+expenses, per-bike, 50/50).
 - Open questions to boss: long-term contracts in/out, Red Panigale card, Борский insurance, barter in revenue, gear line for Шаронов.
+
+---
+Task ID: 112-season-stats-page
+Agent: main (Claude)
+Task: All 145 zip docs accounted (extraction middle step) + dynamic /franchize/[slug]/season-stats subpage (cached, lazy, code-drawn infographics) + verification round entry points + salary verified-payout strip. Boss brief: «may/june only 4 or 9? doublecheck».
+
+Work Log:
+- extraction_accounting.py: joined doc_inventory + zip_structured + zip_match_v2 + task108 manifest + FRESH DB (259 non-cancelled crew rentals). All 145 files classified: 89 imported_db + 2 imported_backfill_v1 (sha / fuzzy score>=5 / exact date+total override) + 14 retro_missing + 16 retro_needs_review (renter-conflict penalty) + 11 testdrive + 4 sale + 9 template; same-sha + same-day/same-bike dup pass; money 68 500 ₽ missing + 88 500 ₽ review. Artifact: scripts/season-2026/extraction_v1.json (+inputs).
+- MAY/JUNE VERDICT: DB май = 4 (36 000 ₽, retro_backfill_v1 rows), июнь = 7 (24 000 ₽; Шаронов из майского Excel лёг на 05.06). Docs: май +7 договоров → будет 11; июнь +2 → будет 9. Июль +14 нетто → 32→46. Август +1 → 82.
+- season-stats page (app/franchize/[slug]/season-stats/): page.tsx (member guard, ownerTier flags), SeasonStatsClient.tsx (KPI grid, CSS-bar timeline per month, conic-gradient verification donut, latest-unverified list with resend, lazy month details w/ client cache: аренды/продажи/касса tabs, archive-coverage card from generated archive-snapshot.ts). NO picture charts — все инфографики кодом (CSS/SVG).
+- server-actions/season-stats.ts: getSeasonStatsOverview (3 narrow range queries + getVerificationStatusMap, in-memory TTL 10 min single-flight cache), getSeasonMonthDetails (lazy, two-range merge dedup), startSeasonVerificationRound (owner-tier, latest completed w/o row, idempotent requestRentalVerification per rental + summary DM, limit<=25), getSalaryVerificationStrip (getCrewPayoutSummary + latest 3). constants split out (use-server files may only export async fns).
+- Verification entry points added: (1) rental page section «🤝 Сверка расчёта» for completed rentals (RoleGuard, resendVerificationDmsAction); (2) rentals-analytics strip button «🎲 Раунд сверки» (owner-tier, strip now visible for owner-tier even with 0 rows); (3) season-stats round button + per-row resends; existing drawer resend/verify + payout-hub untouched (132 pins green).
+- Salary page: «🤝 Сверка выплат» strip (сверено к выплате / не сверено / выплачено counters + latest unverified with rental links + compact resend).
+- Nav: «Сезон 2026» chip in AnalyticsLeadsNav + CrewOperationsPanel.
+- SUMMARY.html v0.3: PNG charts → code-drawn SVG/CSS (archive composition, coverage, missing money), extraction-v1 KPIs (145/145, 30 files not in DB), May/June doublecheck table, live-page card; synced to download/.
+- Verified: next lint clean; scoped tsc 0 errors in changed files (96 pre-existing repo-wide, ignoreBuildErrors); vitest task101–107 (132 tests) pass; dev-server E2E via agent-browser with forged actor cookie: season-stats 200 + real numbers (1 777 667 ₽ / 249 completed / 31 ДКП 13 048 000 ₽ / касса 16 529 382 ₽), июль details lazy-load, donut 0% / 248 ждут / 1 спор, salary strip counters (2 550 ₽ / 2 аренды), guard lock-screen for anon.
+
+Stage Summary:
+- Deliverables: /franchize/[slug]/season-stats (crew-scoped, cached ~10min, lazy details, zero pictures), 3 new verification entry points, salary verification strip, SUMMARY v0.3, extraction_v1.json ready as retro_backfill_v2 payload.
+- Next: boss ✅ → retro_backfill_v2 insert (14+16 contracts, source=retro_backfill_v2, metadata.history audit, idempotent by doc sha + date+vehicle+total); xlsx no-date rows decision (5 шт); Red Panigale в cars?
+
+---
+Task ID: 113-retro-backfill-v2-and-clean-stats
+Agent: main (Claude)
+Task: Finish zip-doc retroimport into Supabase; upload all 145 archive docs to storage; make season-stats Supabase-only (drop zip-derived archive section).
+
+Work Log:
+- retro_backfill_v2.py (scripts/season-2026/): full docx body parse («Итого к оплате», «Размер арендной платы» single-fee guard, spaced digits «1 2 000»), per-doc decisions vs _db_cache (same vehicle+day guard, sha idempotency via metadata.specs.retro_backfill_v2.doc_sha256 + private.rental_contract_artifacts.original_sha256).
+- Imported 21 retro rentals (source=retro_backfill_v2, walk-in user 356282674, fully_paid, deposit_returned, metadata.history audit): May +4 (Стерлягов Zero 09.05, Калинин 16.05 / Могучев 18.05 Falcon Pro, Воронцов 26.05 Kawasaki; totals unknown → 0 + metadata.total_unknown), July +16 (Заваленский 3750, Халикова 17000, Сухарев 5000, Новиков 2250, Шевчук 8000, Ворожейкин 32500, Чуфыркин 12000, Фимин/Локтев 12000, Павликов 28000, Сидоров/Томашевский 8500, Гречковский 10000, Галанов 20000, Алиев+Кузовлев total_unknown), Aug +1 (Ларин Aprilia 6500, договор №05.08/APRILIA — имя файла от старого шаблона). Known money +188 000 ₽.
+- Skipped by design (5): Сидоров 15.06 = субаренда-шаблон; Мирошников 20.05 Horwin CR1, Голубев 01.06 + Шкитин 20.05 DK400-S — байков нет в cars (партнёрские/непарковые); Kawasaki .txt шаблон. Red Panigale (Халикова/Чуфыркин) прикреплена к ducati-panigale-s-electro-black(-chain) с vehicle_note — красной вариации в cars нет.
+- Storage: все 145 docx → bucket rental-contracts, префикс vip-bike/retro/ (ASCII-транслит ключей — Supabase InvalidKey на кириллицу; оригинальные имена в манифесте). 21 rows в private.rental_contract_artifacts (contract_key=retro-<date>-<bike>-<sha8>, rental_id + storage_path + original_sha256) — будущая идемпотентность.
+- Season stats after import (page rule requested||agreed): May 8, June 7, July 48, Aug 82, Sep 104, Oct 31 = 280 rentals, 1 963 667 ₽.
+- Page: удалён zip-раздел «Архив договоров vs база» (archive-snapshot.ts deleted) — season-stats теперь только Supabase-данные для любого экипажа.
+- Gotchas fixed en route: PostgREST writes в private схему требуют Content-Profile (не Accept-Profile); rentals.payment_status NOT NULL; storage keys ASCII-only.
+- next lint clean, typecheck:franchize passed, vitest 3218 pass (170 files).
+
+Stage Summary:
+- Retroimport ZIP завершён: 145/145 документов учтены (21 импорт + 5 skip по правилу «байк есть в cars» + остальные уже были в базе/шаблоны/тест-драйвы/продажи).
+- Сезонная статистика считается целиком из Supabase и корректна для любого crew; май/июнь больше не «rooky».
+- Хвосты для босса: 6 договоров с total_unknown (суммы проставить руками на странице аренды), Red Panigale можно завести в cars и перепривязать 2 аренды, 2 DK400-S и Horwin — вне парка.

@@ -9,14 +9,19 @@ import { cookies } from "next/headers";
 import { supabaseAdmin } from "@/lib/supabase-server";
 import { verifyTelegramActorCookieValue, TELEGRAM_ACTOR_COOKIE } from "@/lib/telegram-actor-cookie";
 
-export const metadata = buildFranchizeSectionMetadata("vip-bike", {
-  sectionTitle: "Как считаются деньги",
-  sectionDescription: "Объяснение всех расчётов: аренда, экипировка, депозиты, комиссия, зарплата",
-});
+// 2026-10-18 review: metadata must resolve the REAL crew slug — the static
+// "vip-bike" export pointed every crew's /calc canonical at vip-bike.
+export async function generateMetadata({ params }: { params: Promise<{ slug: string }> }): Promise<Metadata> {
+  const { slug } = await params;
+  return buildFranchizeSectionMetadata(slug, {
+    sectionTitle: "Как считаются деньги",
+    sectionDescription: "Объяснение всех расчётов: аренда, экипировка, депозиты, комиссия, зарплата",
+  });
+}
 
 export default async function CalcExplainerPage({ params }: { params: Promise<{ slug: string }> }) {
   const { slug } = await params;
-  const { crew } = await getFranchizeBySlug(slug);
+  const { crew, items } = await getFranchizeBySlug(slug);
   const surface = crewPaletteForSurface(crew.theme);
 
   const cookieStore = await cookies();
@@ -52,7 +57,7 @@ export default async function CalcExplainerPage({ params }: { params: Promise<{ 
 
   return (
     <main className="min-h-screen" style={surface.page}>
-      <CrewHeader crew={crew} activePath={`/franchize/${crew.slug || slug}/calc-explainer`} />
+      <CrewHeader crew={crew} activePath={`/franchize/${crew.slug || slug}/calc-explainer`} items={items} />
       <FranchizePageShell theme={crew.theme} contentClassName="space-y-6 max-w-3xl mx-auto">
         <CalcExplainer />
       </FranchizePageShell>

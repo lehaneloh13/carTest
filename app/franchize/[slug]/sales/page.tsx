@@ -2,6 +2,8 @@ import type { Metadata } from "next";
 import Link from "next/link";
 import { ArrowRight, BatteryCharging, Bike, ClipboardList, RefreshCcw, Sparkles } from "lucide-react";
 import { getFranchizeBySlug, type CatalogItemVM } from "@/app/franchize/actions";
+import { hasSalePrice } from "../../lib/catalog-utils";
+import { buildSalesHeadline, isLegacyDefaultsCrew } from "../../lib/content-blocks";
 import { CrewFooter } from "@/app/franchize/components/CrewFooter";
 import { CrewHeader } from "@/app/franchize/components/CrewHeader";
 import { buildFranchizeIntentLinks } from "@/app/franchize/lib/section-links";
@@ -21,12 +23,15 @@ function itemMatchesVertical(item: CatalogItemVM, verticalId: string): boolean {
   if (verticalId === "electric") return category.includes("electro") || category.includes("электро") || category.includes("e-") || isTruthySpec(specs.electric);
   if (verticalId === "used") return category.includes("used") || category.includes("б/у") || category.includes("пробег") || isTruthySpec(specs.used);
   if (verticalId === "trade-in") return isTruthySpec(specs.trade_in) || isTruthySpec(specs.tradeIn) || category.includes("trade");
-  return item.saleAvailable || isTruthySpec(specs.sale) || Number(item.salePrice || 0) > 0;
+  // review round 3: same strict predicate as the SKU counter / rail pill /
+  // about CTA — vertical previews must not list items the counter excludes
+  // (equipment/service never inflate the sales surfaces).
+  return hasSalePrice(item);
 }
 
 function previewItems(items: CatalogItemVM[], verticalId: string): CatalogItemVM[] {
   const matches = items.filter((item) => itemMatchesVertical(item, verticalId));
-  return (matches.length ? matches : items.filter((item) => item.saleAvailable)).slice(0, 3);
+  return (matches.length ? matches : items.filter(hasSalePrice)).slice(0, 3);
 }
 
 const verticalIconById = {
@@ -44,7 +49,11 @@ export async function generateMetadata({ params }: SalesPageProps): Promise<Meta
   const { slug } = await params;
   return buildFranchizeSectionMetadata(slug, {
     sectionTitle: "Sales vertical",
-    sectionDescription: "Продажи новых, электро, б/у и trade-in байков для франшизной витрины.",
+    // vip-bike keeps its electric/configurator pitch; other crews get a crew-
+    // agnostic description (2026-10-18 review: no vip wording in shared SEO).
+    sectionDescription: ({ crew }) => crew.slug === "vip-bike"
+      ? "Продажи новых, электро, б/у и trade-in байков для франшизной витрины."
+      : "Витрина продаж экипажа: позиции, вертикали и заявки.",
     pathSuffix: "/sales",
   });
 }
@@ -55,9 +64,26 @@ export default async function FranchizeSalesPage({ params }: SalesPageProps) {
   const crewSlug = crew.slug || slug;
   const activePath = `/franchize/${crewSlug}/sales`;
   const surface = crewPaletteWithCssVars(crew.theme);
-  const brandName = crew.header.brandName || crew.name || "VIP BIKE";
-  const saleItems = items.filter((item) => item.saleAvailable || Number(item.salePrice || 0) > 0 || isTruthySpec(item.rawSpecs?.sale));
+  // «Экипаж» fallback — the literal "VIP BIKE" was the exact leak class this
+  // page is being cleaned of (2026-10-18 review).
+  const brandName = crew.header.brandName || crew.name || "Экипаж";
+  // Same predicate as the about CTA and the rail's «Продажа» pill
+  // (catalog-utils.hasSalePrice) — an item counts as sellable consistently
+  // everywhere; services/equipment never inflate the sales counter.
+  const saleItems = items.filter(hasSalePrice);
   const salesVerticals = crew.contentBlocks.salesVerticals;
+  // vip-bike-gate (2026-10-18): the «new / electric / used / trade-in» hero
+  // and the configurator CTA are the FIRST crew's sales pitch. A crew with
+  // neither sale items nor its own verticals gets a neutral empty state
+  // instead of vip-bike copy (moto-selection: services-only catalog).
+  const showSalesEmptyState = saleItems.length === 0 && salesVerticals.length === 0;
+  // Review round 2 (2026-10-18): a crew WITH sale items but WITHOUT its own
+  // hydrated verticals must not receive the vip hero tail, configurator CTA
+  // or the «Вертикалей: 0» snapshot cell either — the gate now branches per
+  // block, not just via the empty state.
+  const hasVerticals = salesVerticals.length > 0;
+  const isLegacyCrew = isLegacyDefaultsCrew(crewSlug);
+  const salesHeadline = buildSalesHeadline(brandName, salesVerticals, isLegacyCrew);
   const accentText = readablePaletteTextOnColor(crew.theme.palette.accentMain, crew.theme.palette);
 
   return (
@@ -77,18 +103,42 @@ export default async function FranchizeSalesPage({ params }: SalesPageProps) {
           color: crew.theme.isAuto ? "var(--franchize-text-primary)" : crew.theme.palette.textPrimary,
         }}
       >
+        {showSalesEmptyState ? (
+          <section className="rounded-3xl border border-[var(--sales-border)] bg-[var(--sales-card)] p-6 text-center shadow-2xl md:p-10">
+            <p className="text-xs font-semibold uppercase tracking-[0.22em] text-[var(--sales-accent)]">продажи</p>
+            <h1 className="mt-3 text-2xl font-semibold md:text-3xl">Витрина продаж у {brandName} пока не заполнена</h1>
+            <p className="mx-auto mt-3 max-w-xl text-sm leading-6 opacity-70">
+              Каталог и услуги экипажа уже на месте. Как только появятся позиции на продажу, они соберутся здесь по вертикалям — от витрины до сделки.
+            </p>
+            <div className="mt-6 flex flex-wrap justify-center gap-3">
+              <Link href={`/franchize/${crewSlug}`} className="rounded-full bg-[var(--sales-accent)] px-5 py-3 text-sm font-semibold text-[var(--sales-accent-text)] transition hover:brightness-110">
+                Открыть каталог
+              </Link>
+              <Link href={`/franchize/${crewSlug}/contacts`} className="rounded-full border border-current/20 px-5 py-3 text-sm font-semibold transition hover:border-current/50">
+                Связаться с экипажем
+              </Link>
+            </div>
+          </section>
+        ) : (
+          <>
         <section className="rounded-3xl border border-[var(--sales-border)] bg-[var(--sales-card)] p-6 shadow-2xl md:p-8">
           <p className="text-xs font-semibold uppercase tracking-[0.22em] text-[var(--sales-accent)]">FRZ-R8 • sales vertical</p>
           <div className="mt-4 grid gap-8 lg:grid-cols-[1.15fr,0.85fr] lg:items-end">
             <div>
-              <h1 className="font-orbitron text-4xl leading-tight md:text-6xl">Продажи {brandName}: new / electric / used / trade-in</h1>
+              <h1 className="font-orbitron text-4xl leading-tight md:text-6xl">{salesHeadline}</h1>
               <p className="mt-4 max-w-2xl text-base opacity-70 md:text-lg">
-                Страница собирает все продажные сценарии в один операторский вход: от заявки на новый байк до trade-in оценки и электро-конфигуратора.
+                {hasVerticals
+                  ? "Страница собирает все продажные сценарии в один операторский вход: от заявки на новый байк до trade-in оценки и электро-конфигуратора."
+                  : "Продажные позиции экипажа в одном месте: выбирайте технику и отправляйте заявку оператору — от витрины до сделки."}
               </p>
               <div className="mt-6 flex flex-wrap gap-3">
-                <Link href={`/franchize/${crewSlug}/configurator`} className="rounded-full bg-[var(--sales-accent)] px-5 py-3 text-sm font-semibold text-[var(--sales-accent-text)] transition hover:brightness-110">
-                  Открыть конфигуратор
-                </Link>
+                {/* Конфигуратор — vip-bike product surface (electro configurator);
+                    other crews must not be routed into it from the sales hero. */}
+                {isLegacyCrew ? (
+                  <Link href={`/franchize/${crewSlug}/configurator`} className="rounded-full bg-[var(--sales-accent)] px-5 py-3 text-sm font-semibold text-[var(--sales-accent-text)] transition hover:brightness-110">
+                    Открыть конфигуратор
+                  </Link>
+                ) : null}
                 <Link href={`/franchize/${crewSlug}/onboarding`} className="rounded-full border border-current/20 px-5 py-3 text-sm font-semibold transition hover:border-current/50">
                   Partner checklist
                 </Link>
@@ -104,10 +154,12 @@ export default async function FranchizeSalesPage({ params }: SalesPageProps) {
                   <dt className="opacity-55">Продажных SKU</dt>
                   <dd className="mt-1 text-2xl font-semibold text-[var(--sales-accent)]">{saleItems.length}</dd>
                 </div>
-                <div className="rounded-2xl border border-[var(--sales-border)] bg-[var(--sales-card-faint)] p-3">
-                  <dt className="opacity-55">Вертикалей</dt>
-                  <dd className="mt-1 text-2xl font-semibold text-[var(--sales-accent)]">{salesVerticals.length}</dd>
-                </div>
+                {hasVerticals ? (
+                  <div className="rounded-2xl border border-[var(--sales-border)] bg-[var(--sales-card-faint)] p-3">
+                    <dt className="opacity-55">Вертикалей</dt>
+                    <dd className="mt-1 text-2xl font-semibold text-[var(--sales-accent)]">{salesVerticals.length}</dd>
+                  </div>
+                ) : null}
               </dl>
             </aside>
           </div>
@@ -141,6 +193,8 @@ export default async function FranchizeSalesPage({ params }: SalesPageProps) {
             );
           })}
         </section>
+          </>
+        )}
       </div>
       <CrewFooter crew={crew} />
     </main>

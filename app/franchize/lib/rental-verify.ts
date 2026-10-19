@@ -45,6 +45,8 @@ import {
 } from "@/lib/salary-coefficients";
 import { equipmentFlagsLabel } from "@/lib/salary-coefficients-shared";
 import { resolveRentalOperator, type ShiftLike } from "@/app/franchize/lib/operator-attribution";
+// Task 114: per-rental audit grade computed at request time (pure module).
+import { buildAuditStamp, computeRentalAuditGrade } from "@/app/franchize/lib/rental-audit";
 import {
   grantFranchizeAchievementAction,
   syncFranchizeCountersAction,
@@ -287,9 +289,10 @@ export async function requestRentalVerification(params: {
       .from("rentals")
       .select(`
         rental_id, crew_id, owner_id, total_cost, metadata, status,
+        deposit_amount, deposit_returned,
         created_by_operator_chat_id, created_at,
         requested_start_date, requested_end_date, agreed_start_date, agreed_end_date,
-        vehicle:cars(id, make, model, specs, daily_price, type, crew_id)
+        vehicle:cars(id, make, model, specs, daily_price, type, crew_id, is_test_result)
       `)
       .eq("rental_id", params.rentalId)
       .maybeSingle();
@@ -351,6 +354,45 @@ export async function requestRentalVerification(params: {
       crewId: rental.crew_id,
       requestedAtIso: nowIso,
     });
+
+    // ── Task 114: audit grade — frozen with the numbers ──
+    // Same 8 checks as the Aug/Sep/Oct backfill audit, now for EVERY new row:
+    // bulkVerifyFineAction reads snapshot.audit.grade, so a missing stamp
+    // would make the monthly «✅ fine» sweep blind to fresh closures.
+    try {
+      let artifact: { total_sum?: number | null; deposit_rub?: number | null } | null = null;
+      if (meta.source === "doc_command" && Number(rental.total_cost) > 0) {
+        const privateSchema = (supabaseAdmin as unknown as { schema: (s: string) => typeof supabaseAdmin }).schema("private");
+        const { data: art } = await privateSchema
+          .from("rental_contract_artifacts")
+          .select("total_sum, deposit_rub")
+          .eq("rental_id", rental.rental_id)
+          .maybeSingle();
+        artifact = art || null;
+      }
+      snapshot.audit = buildAuditStamp(
+        computeRentalAuditGrade({
+          status: rental.status,
+          totalCost: rental.total_cost,
+          depositAmount: rental.deposit_amount,
+          depositReturned: rental.deposit_returned,
+          metadata: meta,
+          requestedStartDate: rental.requested_start_date,
+          requestedEndDate: rental.requested_end_date,
+          agreedStartDate: rental.agreed_start_date,
+          agreedEndDate: rental.agreed_end_date,
+          createdByOperatorChatId: rental.created_by_operator_chat_id,
+          vehicleType: vehicle?.type ?? null,
+          isTestResult: (vehicle as any)?.is_test_result === true,
+          artifact: artifact ? { totalSum: artifact.total_sum, depositRub: artifact.deposit_rub } : null,
+        }),
+        nowIso,
+        "auto-audit-2026-10-19",
+      );
+    } catch (auditErr) {
+      // Non-fatal: an ungraded row only loses the bulk sweep shortcut.
+      logger.warn(`[rental-verify] audit grade failed for ${rental.rental_id} (non-fatal):`, auditErr);
+    }
 
     const { data: crewRow } = await supabaseAdmin
       .from("crews")
@@ -428,6 +470,32 @@ export async function requestRentalVerification(params: {
         logger.warn(`[rental-verify] summary send failed for ${chatId} (rental ${rental.rental_id}):`, e);
       }
     }
+
+    // ── VF-FIX 2026-10-18: cc the crew owner + admins (read-only copy) ──
+    // Boss: «upon closing rental notification for verification is sent to
+    // crew owner, crew admins». The ✅/⚠️ game itself stays between the two
+    // parties (the state machine bounces foreign chat ids); the staff copy
+    // is FYI + a deeplink into the drawer, where an owner-tier admin can
+    // confirm manually (✓ подтвердить сверку / 📤 выслать сверку в TG).
+    try {
+      const ccSent = await ccVerificationToCrewStaff({
+        crewSlug,
+        rentalId: rental.rental_id,
+        summary,
+        exclude: [
+          operatorChatId,
+          ownerChatId,
+          String(params.actorChatId || ""),
+          snapshot.attribution.createdByChatId,
+          snapshot.attribution.handedByChatId,
+          snapshot.attribution.returnedByChatId,
+        ],
+      });
+      if (ccSent > 0) logger.info(`[rental-verify] staff cc sent to ${ccSent} chat(s) for ${rental.rental_id}`);
+    } catch (ccErr) {
+      logger.warn("[rental-verify] staff cc failed (non-fatal):", ccErr);
+    }
+
     logger.info(
       `[rental-verify] verification requested for ${rental.rental_id}: operator=${operatorChatId ?? "—"} owner=${ownerChatId ?? "—"} total=${snapshot.total}₽`,
     );
@@ -436,6 +504,73 @@ export async function requestRentalVerification(params: {
     logger.warn(`[rental-verify] requestRentalVerification failed for ${params.rentalId} (non-fatal):`, err);
     return { sent: false, reason: "exception" };
   }
+}
+
+// ── VF-FIX 2026-10-18: staff cc helper ─────────────────────────────────────
+
+/**
+ * Read-only copy of the verification summary to crew owner + admins
+ * (resolveLeadNotifyRecipients, no member fanout), deduped against the
+ * verification parties / actor / attribution chats. No ✅/⚠️ buttons — the
+ * state machine only accepts the two parties; staff confirm in the app
+ * drawer instead. Never throws (caller wraps non-fatal anyway).
+ */
+export async function ccVerificationToCrewStaff(params: {
+  crewSlug: string | null;
+  rentalId: string;
+  summary: string;
+  exclude: Array<string | null | undefined>;
+}): Promise<number> {
+  if (!params.crewSlug) return 0;
+  const { resolveLeadNotifyRecipients } = await import("@/app/franchize/lib/new-lead-notify");
+  const { telegramDeliver } = await import("@/lib/telegram-transport");
+  const { buildTelegramAppLink } = await import("@/lib/wall-deeplink");
+  const { resolveCrewBotUsername } = await import("@/app/franchize/lib/crew-bot");
+
+  const excludeSet = new Set(params.exclude.filter(Boolean).map(String));
+  const targets = (await resolveLeadNotifyRecipients(params.crewSlug, { includeMembers: false }))
+    .map((id) => (id == null ? null : String(id)))
+    .filter((id): id is string => !!id && !excludeSet.has(id));
+  if (targets.length === 0) return 0;
+
+  let botUsername: string | null = null;
+  try {
+    botUsername = await resolveCrewBotUsername(params.crewSlug);
+  } catch {
+    // deeplink — best effort
+  }
+
+  const text = [
+    params.summary,
+    "",
+    "📋 Копия для команды — кнопки ✅/⚠️ у оператора и владельца.",
+    "Подтвердить сверку вручную можно в приложении: аналитика аренд → карточка аренды.",
+  ].join("\n");
+  const payload: Record<string, unknown> = {
+    text,
+    parse_mode: "HTML",
+    disable_web_page_preview: true,
+  };
+  if (botUsername) {
+    payload.reply_markup = {
+      inline_keyboard: [
+        [{ text: "🔑 Открыть аренду", url: buildTelegramAppLink(botUsername, `rental_${params.rentalId}`) }],
+      ],
+    };
+  }
+
+  let sent = 0;
+  await Promise.allSettled(
+    targets.map(async (chatId) => {
+      try {
+        const res = await telegramDeliver("sendMessage", chatId, payload);
+        if (res?.ok !== false) sent += 1;
+      } catch (e) {
+        logger.warn(`[rental-verify] staff cc send failed for ${chatId} (rental ${params.rentalId}):`, e);
+      }
+    }),
+  );
+  return sent;
 }
 
 // ── Callback handling (Telegram buttons) ─────────────────────────────────────
@@ -1345,8 +1480,11 @@ export async function getVerificationStatusMap(rentalIds: string[]): Promise<Map
     // Task 106: negotiation rides along so the UI can show «предложение
     // отправлено» chips and the agreed (corrected) split. Falls back to a
     // negotiation-free select while the column is not applied yet.
-    const COLS_WITH_NEGO = "rental_id, status, operator_chat_id, owner_chat_id, negotiation";
-    const COLS_PLAIN = "rental_id, status, operator_chat_id, owner_chat_id";
+    // Task 114: audit:snapshot->audit rides along (PostgREST jsonb key pick —
+    // avoids dragging full snapshots) so the drawer can show WHY a row is
+    // almost/sus without another query.
+    const COLS_WITH_NEGO = "rental_id, status, operator_chat_id, owner_chat_id, negotiation, audit:snapshot->audit";
+    const COLS_PLAIN = "rental_id, status, operator_chat_id, owner_chat_id, audit:snapshot->audit";
     const CHUNK = 200;
     for (let i = 0; i < ids.length; i += CHUNK) {
       const chunk = ids.slice(i, i + CHUNK);
@@ -1366,11 +1504,13 @@ export async function getVerificationStatusMap(rentalIds: string[]): Promise<Map
       if (selErr) throw selErr;
       for (const row of rows || []) {
         const nego = row.negotiation !== undefined ? parseNegotiation(row.negotiation) : null;
+        const audit = (row.audit ?? null) as { grade?: string; notes?: string[] } | null;
         map.set(String(row.rental_id), {
           status: row.status,
           operatorChatId: row.operator_chat_id,
           ownerChatId: row.owner_chat_id,
           ...(nego ? { proposalOpen: !!nego.open, agreedSplit: nego.agreed ? nego.agreed.split : null } : {}),
+          ...(audit && typeof audit === "object" ? { audit } : {}),
         });
       }
     }

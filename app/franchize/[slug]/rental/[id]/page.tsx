@@ -1,4 +1,13 @@
 // /app/franchize/[slug]/rental/[id]/page.tsx
+// maxDuration=60 (vf-fix 2026-10-18): this segment hosts the return-flow server
+// actions (confirmVehicleReturn etc.). Their awaited chain — money writes,
+// renter receipt TG, review nudge, ride-share, achievements, VERIFICATION
+// request — routinely exceeds Vercel's ~10s default, and the lambda died at
+// the tail: the rental closed but the verification row/DMs never happened
+// (falcon-gt 2026-10-18 17:11 — exactly the bd948bd0 incident class).
+// The page segment config covers the actions POSTed from it.
+export const maxDuration = 60;
+
 import type { Metadata } from "next";
 import Link from "next/link";
 import { cookies } from "next/headers";
@@ -14,6 +23,7 @@ import { CrewHeader } from "../../../components/CrewHeader";
 import { FranchizeErrorBoundary } from "../../../components/ErrorBoundary";
 import { DisplayModeProvider } from "../../../components/DisplayModeContext";
 import { FranchizeRentalLifecycleActions } from "../../../components/FranchizeRentalLifecycleActions";
+import { VerificationResendButton } from "../../../components/VerificationResendButton";
 // goodmorning-polish: removed FranchizePageShell import — replaced with plain <div>
 // to avoid backdrop-blur breaking position:fixed on QuickActionBar + excessive padding.
 import { FranchizeRentalDocumentsPanel } from "../../../components/FranchizeRentalDocumentsPanel";
@@ -284,7 +294,7 @@ export default async function FranchizeRentalPage({ params }: FranchizeRentalPag
         crew={crew}
         activePath={`/franchize/${resolvedSlug}/rental/${id}`}
         groupLinks={items.map((item) => item.category)}
-      />
+      items={items} />
       </FranchizeErrorBoundary>
       </DisplayModeProvider>
 
@@ -776,6 +786,33 @@ export default async function FranchizeRentalPage({ params }: FranchizeRentalPag
             </FranchizeErrorBoundary>
           </div>
         </FranchizeRentalRoleGuard>
+
+        {/* Сверка расчёта — ручной запуск по закрытой аренде (owner-tier).
+            Дублирует entry points сверки: страница аренды теперь тоже может
+            инициировать раунд «✅/⚠️» без похода в аналитику. */}
+        {status === "completed" && (
+          <FranchizeRentalRoleGuard
+            allowedRoles={["operator", "admin", "owner"]}
+            ownerId={rental.ownerId}
+            renterId={rental.renterId}
+            renterTelegramChatId={rental.renterTelegramChatId}
+            subrenterChatId={rental.subrenterChatId}
+            crewId={crew.id}
+            crewSlug={resolvedSlug}
+          >
+            <section className="rounded-2xl border p-3 flex flex-wrap items-center gap-2" style={surface.subtleCard}>
+              <div className="min-w-0">
+                <p className="text-xs font-semibold" style={{ color: textPrimary }}>🤝 Сверка расчёта</p>
+                <p className="text-[11px]" style={{ color: textSecondary }}>
+                  Оператор и владелец получат личные сообщения с кнопками ✅/⚠️ по этой аренде.
+                </p>
+              </div>
+              <div className="ml-auto">
+                <VerificationResendButton slug={resolvedSlug} rentalId={rental.rentalId} />
+              </div>
+            </section>
+          </FranchizeRentalRoleGuard>
+        )}
 
         {/* Phase 5: Renter-specific actions panel */}
         {rental.found && (
