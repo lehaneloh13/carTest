@@ -37,6 +37,8 @@ import {
 } from "@/app/franchize/lib/rental-payout-core";
 import {
   computeRentalSalary,
+  equipmentStandardCost,
+  equipmentStandardLines,
   isShortRentalHours,
   OFFICIAL_SALARY_CONFIG,
 } from "@/lib/salary-coefficients-shared";
@@ -300,16 +302,62 @@ describe("task120 · the сверка DM shows the short-rental rule", () => {
 
   it("short rental → the legend line spells out 1000→500 · 200→100", () => {
     const text = nbsp(summary(shortFormula));
-    expect(text).toContain("аренда < 24 ч — комиссия пополам");
+    expect(text).toContain("аренда &lt; 24 ч — комиссия пополам");
     expect(text).toContain(nbsp(`мот ${rub(1000)} → ${rub(500)}`));
     expect(text).toContain(nbsp(`экип ${rub(200)} → ${rub(100)}/ед`));
     expect(text).toContain("аренда меньше суток — комиссия пополам");
+  });
+
+  // HOTFIX 2026-10-22 (bmw-f800r 8450ef3b): the summary travels with
+  // parse_mode=HTML — a RAW `<` literal made Telegram reject EVERY copy with
+  // 400 "can't parse entities" and the сверка never reached anyone. Guard:
+  // after stripping the Telegram-allowed tags nothing may look like markup.
+  it("summary contains no raw '<' outside Telegram HTML tags (hotfix regression)", () => {
+    const ALLOWED = /<\/?\s*(b|strong|i|em|u|ins|s|strike|del|span|tg-spoiler|a|code|pre|blockquote)(\s[^>]*)?>/gi;
+    const naked = (t: string) => t.replace(ALLOWED, "");
+    const short = summary(shortFormula);
+    const full = summary({ ...shortFormula, shortRental: false });
+    expect(naked(short)).not.toMatch(/[<>]/);
+    expect(naked(full)).not.toMatch(/[<>]/);
+    // and the literal itself must be escaped, not raw
+    expect(summary(shortFormula)).toContain("&lt; 24 ч");
   });
 
   it("full-day rows render the classic legend (no halving line)", () => {
     const text = nbsp(summary({ ...shortFormula, shortRental: false }));
     expect(text).not.toContain("комиссия пополам: мот");
     expect(text).toContain(nbsp(`мот ${rub(1000)}/аренда`));
+  });
+});
+
+// ── 3.5 Task 121: gear эталон halves on <24h (client price) ────────────────
+
+describe("task121 · gear эталон halves on short rentals", () => {
+  const EQ = { helmets: 1, gloves: 1 };
+
+  it("equipmentStandardCost halves for <24h windows (шлем 1000→500 · остальное 500→250)", () => {
+    expect(equipmentStandardCost(EQ, 1, 2)).toBe(500 + 250); // 2h window → 750
+    expect(equipmentStandardCost(EQ, 1, 23)).toBe(500 + 250); // still short
+    expect(equipmentStandardCost(EQ, 1, 24)).toBe(1000 + 500); // boundary: 24h is NOT short
+    expect(equipmentStandardCost(EQ, 1, 72)).toBe(1000 + 500); // full days
+    expect(equipmentStandardCost(EQ, 1)).toBe(1000 + 500); // hours unknown → full
+    expect(equipmentStandardCost(EQ, 3)).toBe(1000 * 2 + 500 * 2); // multi-day taper untouched
+  });
+
+  it("equipmentStandardLines halves with the same hours canon (digit-equal with the cost)", () => {
+    expect(equipmentStandardLines(EQ, 2).map((l) => l.sum)).toEqual([500, 250]);
+    expect(equipmentStandardLines(EQ).map((l) => l.sum)).toEqual([1000, 500]);
+    // lines + cost stay digit-equal:
+    const linesSum = equipmentStandardLines(EQ, 2).reduce((s, l) => s + l.sum, 0);
+    expect(linesSum).toBe(equipmentStandardCost(EQ, 1, 2));
+  });
+
+  it("call sites pass stdDetail.hours (one canon across all four sites)", () => {
+    expect(read("app/franchize/lib/rental-verify.ts")).toContain("equipmentStandardCost(eq, gearDays, stdDetail.hours)");
+    expect(read("app/franchize/lib/rental-verify.ts")).toContain("equipmentStandardLines(eq, stdDetail.hours)");
+    expect(read("app/franchize/lib/salary-category-bonuses.ts")).toContain("equipmentStandardCost(eq, gearDays, stdDetail.hours)");
+    expect(read("lib/csv-builders/rentals-csv.ts")).toContain("equipmentStandardCost(eq, gearDays, stdDetail.hours)");
+    expect(read("app/franchize/server-actions/my-work.ts")).toContain("equipmentStandardCost(eq, gearDays, stdDetail.hours)");
   });
 });
 
@@ -391,7 +439,10 @@ describe("task120 · wiring pins", () => {
   it("the snapshot formula type carries shortRental and the DM renders it", () => {
     const core = read("app/franchize/lib/rental-verify-core.ts");
     expect(core).toContain("shortRental?: boolean");
-    expect(core).toContain("аренда < 24 ч — комиссия пополам");
+    // HOTFIX 2026-10-22: the legend goes out with parse_mode=HTML — raw '<'
+    // is a 400. The source must carry the ESCAPED entity.
+    expect(core).toContain("аренда &lt; 24 ч — комиссия пополам");
+    expect(core).not.toContain("аренда < 24 ч");
   });
 
   it("photo guards are ditched: no 2h window left anywhere", () => {
