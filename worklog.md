@@ -997,3 +997,89 @@ Stage Summary:
 - Retroimport ZIP завершён: 145/145 документов учтены (21 импорт + 5 skip по правилу «байк есть в cars» + остальные уже были в базе/шаблоны/тест-драйвы/продажи).
 - Сезонная статистика считается целиком из Supabase и корректна для любого crew; май/июнь больше не «rooky».
 - Хвосты для босса: 6 договоров с total_unknown (суммы проставить руками на странице аренды), Red Panigale можно завести в cars и перепривязать 2 аренды, 2 DK400-S и Horwin — вне парка.
+
+---
+Task ID: 111-monthly-stats-lightbox-retro-v2
+Agent: main (Claude)
+Task: Monthly rentals summary (May-Oct) + May/June doublecheck (boss: «isn't count too low? seems suspicious»); finish retro_backfill_v2 leftovers; map-riders lightbox ✕ fix.
+
+Work Log:
+- monthly_rentals.py (fresh fetch, agreed_start_date fallback created_at): May=4, Jun=7 vs Jul=33/Aug=83/Sep=109 → confirmed suspicious; gap = zip contracts not yet in DB (see tasks 112/113).
+- Reconciled this session's curated 24-row list against task113's 21 imported rows (fresh-DB idempotency pre-check) and FINISHED the leftovers:
+  - +3 rentals that task113 skipped «байка нет в cars»: Мирошников 20.05 (Horwin CR1), Шкитин 20.05 и Голубев 01.06 (Ducati Panigale) — для FK добавлены hidden cars rows (specs.hidden=true, quantity=0; cars required: description+image_url NOT NULL).
+  - Ларин №05.08/APRILIA: договор подписан 05.08 задним числом, но срок аренды по тексту — 29.06 18:30–20:30 → даты записи исправлены на 29.06 (июнь +6500 ₽, август -6500 ₽).
+  - Чуфыркин 05.07 и Халикова 08.07: в договоре ТС RED → добавлен hidden cars id ducati-panigale-s-electro-red, vehicle_id перепривязан с black.
+  - total_cost 0→null ×4 (Стерлягов/Воронцов/Кузовлев/Алиев — суммы в договорах не зафиксированы; 0 искажал средний чек).
+  - Хвосты task113 закрыты: «Red Panigale в cars» — сделано; «2 DK400-S и Horwin вне парка» — заведены hidden.
+- Storage: canonical 145-doc архив task113 сохранён; 18 дублей этого сеанса удалены (точное совпадение размера+имени), 24/24 retro-арендам проставлен metadata.doc_storage_paths → canonical-объекты (retro_storage_dedupe.py / retro_storage_relink.py). manifest: scripts/season-2026/retro_backfill_v2_manifest.json.
+- Итог по месяцам (agreed_start_date): May 4→10, Jun 7→9 (+6 500 ₽), Jul 33→49 (+179 500 ₽), Aug 83 (без Ларина), Sep 109. Всего в БД 308 rentals, из них 24 retro_backfill_v2.
+- map-riders lightbox ✕ (PC, clicks go through to map): воспроизведён headless (dev server + agent-browser). Root cause: Radix DismissableLayer (disableOutsidePointerEvents) ставит body.style.pointerEvents='none' и восстанавливает только на чистом unmount — при ошибке жизненного цикла body остаётся «none», body-порталы наследуют, MapPhotoLightbox становится click-прозрачным (elementFromPoint на ✕ возвращал <html>). Fix: явный pointerEvents:auto на корнях фуллскрин-порталов (MapPhotoLightbox, PhotoLightbox стены, route-replay оверлей шита) — тот же приём, что у Radix DialogOverlay. Проверено: ✕ кликается, клик закрывает, клик по фону закрывает — при stuck body pe=none.
+
+Stage Summary:
+- Ретро-импорт доведён до конца: 24 retro_backfill_v2 аренды, все документы в storage связаны с записями, дубли удалены, май/июнь больше не «rooky» (10/9), сезон по деньгам ~+186 000 ₽ к состоянию task113.
+- Lightbox fix: fix(map-riders) commit в этом же пуше.
+
+---
+Task ID: 111b-vipbike-post-to-djorudjov
+Agent: main (Claude)
+Task: vip-bike post for today (weather + wheel-of-fortune deeplink + picture) → send draft to @DJORUDJOV with map-riders deeplink so he creates the post there.
+
+Work Log:
+- Deeplinks verified in use-start-param-target.ts: startapp=wheel → /franchize/vip-bike/vip-bike/wheel (промокоды 1000/2000/5000 ₽ / 15%), startapp=mapriders_vip-bike → /franchize/vip-bike/map-riders.
+- Weather 21.10 NN: +10..+12°, солнце, без осадков → текст «последние тёплые дни сезона».
+- Picture: z-ai image gen 864x1152 (autumn riverside rider, cable bridge NN vibes) → JPG (bridge sends .png as document) → wallpix/posts/2026-10-21-vipbike-ride.jpg (public URL).
+- Delivery: POST /api/codex-bridge/callback (x-codex-bridge-secret) → telegramChatId=7813830016 (@DJORUDJOV, users.user_id) — 200 ok, telegram ok:true sentImages:1 (slack echo C0AFHM0ANNL). Caption = инструкция + готовый текст поста с wheel-диплинком.
+- Script: scripts/…send_djorudjov_post.py (local scripts dir, not committed).
+
+Stage Summary:
+- Post draft delivered to djorudjov: publish via mapriders_vip-bike deeplink; post includes wheel promo deeplink.
+
+---
+Task ID: 114-wheel-codereview-broadcast-stats
+Agent: main (Claude)
+Task: boss 2026-10-21 — codereview wheel of fortune; doublecheck «startapp=wheel seems not working»; see broadcast stats for the created post; final stats notification to post creator after fanout finishes.
+
+Work Log:
+- Broadcast stats (today's post 78d6c48f, author DJORUDJOV 7813830016): notify_job status=done, audience=past, sent=27, failed=4, finished 13:44:03 (≈21с), ledger=27 — pulled from crew_posts.metadata via PostgREST.
+- startapp=wheel ROOT CAUSE: end-to-end repro with agent-browser. Main + preview (v0-car-test.vercel.app/?tgWebAppStartParam=wheel) route correctly → /franchize/vip-bike/wheel (page renders). But rental.vip-bike.ru (the PROD host behind the bot's mini app) routes ?tgWebAppStartParam=wheel → /wheel → 404, и wheel_vip-bike → /wheel_vip-bike 404, при том что mapriders_vip-bike работает. Значит prod-билд знает mapriders_ fast-path (28f0c3a) но НЕ знает wheel-записи START_PARAM_PAGE_MAP (2a130ce, тот же день позже) — prod отстаёт от main; unknown-param fallback `/${param}` превращает wheel в /wheel. t.me/oneBikePlsBot/app валиден («Open App»). FIX = перевыпустить production deployment (заодно подхватятся фикс лайтбокса f16f2a4 и остальное).
+- Broadcast final stats notification (boss ask): community-wall.ts + buildWallBroadcastStatsHtml (✅ Рассылка завершена — доставлено N, не доставлено M, аудитория, ⏱ длительность, превью) + formatBroadcastDuration; pre-copy header честно переименован в «Начата рассылка…». wall-renter-notify.ts: флаг creator_stats_notified (пишется той же CAS-записью, что status=done — дублей от кронов нет), сводка уходит и на пустой аудитории; failed-получатели прогона ретраятся ОДИН раз в конце (бюджет permitting, only not-in-ledger — exactly-once сохранён).
+- Wheel codereview: pick-before-animation / server-side promo revalidation / anon no-op / dedupe+eviction / cooldown-on-start / unmount-safe timer — ок. Найдено: (1) комментарий «сумма весов = 100» врал (реально 112) — исправлен; (2) claimWheelWinNotifySlot сжигает слот даже при неудавшейся доставке (at-most-once/сутки на инстанс) — задокументировано, не меняем; (3) «В корзину с промокодом» в DM ведёт на WEB-URL (не t.me deeplink) — UX-заметка; (4) scripts/wheel-challenge-post.mjs хардкодит service_role ключ — заменить на env-only (гигиена).
+- Tests: wall-renter-notify.spec.ts +6 (stats HTML, plural forms, duration, audience labels, CAS-flag порядок done, in-run retry); 62/62 ✓; wheel-promo + winner-notify + startapp-routing + community-wall + robustness 140 ✓; tsc --noEmit: 0 ошибок (с и без правок).
+
+Stage Summary:
+- Creator теперь получает ДВЕ нотификации: «рассылка начата (аудитория N)» перед fanout и «✅ завершено: доставлено X / не доставлено Y» после; счётчик доставленных честный (ledger + один in-run ретрай провалов).
+- startapp=wheel в коде корректен — баг живёт в устаревшем prod-деплое rental.vip-bike.ru; нужно redeploy production.
+
+---
+Task ID: 115-ads-crud-wheel-hydration
+Agent: main (Claude)
+Task: boss 2026-10-21 — extend catalog ADS editing with delete/create; add wheel AD to vip-bike; doublecheck wheel is crew-agnostic; add wheel link to crew header main menu via crew metadata (docs/crewDocs vip-bike hydration sql).
+
+Work Log:
+- Root cause «can't create ad items»: CatalogCardsQuickAdmin.addRow set expandedId «new-ad-N», but rowKey() built «ad-N» from empty row.id → keys NEVER matched, fresh card rendered collapsed at the list bottom → looked like create is broken (edit-only UI). Delete existed all along inside the expanded panel.
+- Fix: addRow mints a stable temp id (`ad-<base36 ts>` / `promo-…`) right at creation; expandedId matches rowKey exactly → new card auto-expands + scrollIntoView (block:center) via rAF; row wrapper got id="card-row-<key>" anchor. Server keeps non-empty client ids as-is (row.id.trim() || mint) — id stable across saves.
+- Wheel crew-agnosticism VERIFIED: page /franchize/[slug]/wheel (dynamic slug), server action slug from request, lib slug-parameterized (storage key `franchize-wheel-spin:{slug}`), zero vip-bike hardcode; WHEEL1000/2000/5000/15 are platform-level BUILT_IN_PROMO_CODES valid on any crew cart.
+- Hydrated live vip-bike metadata (scripts/task115-hydrate-wheel-vipbike.py, idempotent, re-run verified): catalog.adCards += wheel-fortune-card (badge «Призы каждый день», prio 96 top, href /franchize/vip-bike/wheel, active 2026-10-21..2026-12-31); header.menuLinks += «Колесо фортуны» → /franchize/{slug}/wheel inserted after «Карта» (12→13 links). Only these two arrays touched, sibling metadata byte-identical.
+- docs/crewDocs/vip-bike-franchize-hydration.sql: menuLinks + wheel entry, adCards re-synced to live mirror (4 cards incl. wheel) — re-hydration never wipes live cards (file's own rule).
+- Tests: catalog-cards-admin.spec.ts +1 (client temp id survives save) → 15/15 ✓; wheel-promo + wheel-winner-notify 39/39 ✓. Scoped tsc on touched files: 24 pre-existing union-access errors at HEAD == 24 with change (0 regressions; full-repo tsc OOMs in sandbox, exit 137).
+- E2E on local dev vs prod Supabase: /franchize/vip-bike renders wheel ad (badge+CTA in HTML), /franchize/vip-bike/wheel 200 with КРУТИТЬ CTA.
+
+Stage Summary:
+- QuickAdmin «Карточки» now honestly supports create (auto-expanded new card) + edit + delete for both Промо-баннеры and Анонсы tabs; boss note: prod (rental.vip-bike.ru) may still serve an older build — redeploy production to see it (same story as startapp=wheel from task 114).
+- vip-bike live: wheel is the top ad card (prio 96) and sits in the hamburger menu 3rd; hydration SQL + idempotent script committed for reproducibility.
+
+---
+Task ID: 116-wheel-deeplink-both-formats
+Agent: main (Claude)
+Task: boss 2026-10-21 — clarify: does startapp=wheel default to vip-bike? can deeplinks route to OTHER crews' wheel pages (e.g. startapp=nn-mototeh-nn_wheel)?
+
+Work Log:
+- Verified in code (hooks/use-start-param-target.ts): bare «wheel»/«wheel_of_fortune»/«fortune» → /franchize/vip-bike/wheel (START_PARAM_PAGE_MAP, главная витрина). Per-crew wheel deeplinks existed since 2a130ce as PREFIX form wheel_<slug> (static fast path, no auth wait, slug regex [a-z0-9-]{1,64} lowercase-only).
+- Boss's suffix example nn-mototeh-nn_wheel was NOT recognized → fell to router's final fallback /${param} → 404.
+- Added suffix branch <slug>_wheel to computeStaticFastTarget (same validation as prefix form; slugs never contain underscores → suffix unambiguous; wall-params never end with _wheel → no grammar conflicts). Now BOTH wheel_<slug> and <slug>_wheel work.
+- E2E: /franchize/nn-mototeh-nn/wheel renders 200 on dev vs prod Supabase (crew-agnostic wheel confirmed for a second crew, themed header/content).
+- Tests: startapp-routing-regression +2 (suffix round-trip via buildTelegramAppLink, hostile/empty slug rejection, wheel_wheel precedence) → 81/81 across 4 routing specs ✓.
+
+Stage Summary:
+- startapp=wheel → vip-bike (да, дефолт); startapp=wheel_nn-mototeh-nn И startapp=nn-mototeh-nn_wheel → /franchize/nn-mototeh-nn/wheel. Link format for posts: https://t.me/oneBikePlsBot/app?startapp=<any of the three forms>.
+- Не забыть: prod rental.vip-bike.ru всё ещё отстаёт от main (task 114 note) — redeploy production, чтобы suffix-форма и остальные фиксы доехали.

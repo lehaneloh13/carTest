@@ -35,6 +35,7 @@ import {
   selfHealVerificationRow,
 } from "./rental-verify";
 import {
+  buildCrewPayoutLedger,
   buildPayoutItem,
   commissionOf,
   encodePayoutCallback,
@@ -54,12 +55,17 @@ import {
   payoutHubKeyboard,
   summarizePayoutItems,
   PAYOUT_PAGE_SIZE,
+  type CrewPayoutLedgerView,
   type PayoutConvertible,
   type PayoutInfo,
   type PayoutItem,
   type PayoutSummary,
   type PayoutSourceRow,
 } from "./rental-payout-core";
+
+// Task 120: the action layer imports this type from THIS module (one import
+// path) — the plain import above is not a re-export, so spell it out.
+export type { CrewPayoutLedgerView };
 
 const PAYOUT_SQL_HINT = "примените SQL: docs/crewDocs/rental-verifications-payout-2026-10-18.sql";
 
@@ -770,4 +776,29 @@ export async function getCrewPayoutSummary(slug: string): Promise<PayoutSummaryV
     if (item) items.push(item);
   }
   return { ...summarizePayoutItems(items), payoutColumnMissing: res.payoutColumnMissing };
+}
+
+/**
+ * Task 117 — КОПИЛКА КОМАНДЫ: crew-wide ledger of verified commissions with
+ * per-operator piggy banks, the actionable «к выплате» list and the paid
+ * archive. The per-row payout stamps (payout jsonb log[]) ARE the entries —
+ * the owner marks them from the profile (stampRentalPayout enforces rights).
+ */
+export async function getCrewPayoutLedger(slug: string): Promise<CrewPayoutLedgerView> {
+  const res = await runPayoutSelect((cols) =>
+    supabaseAdmin.from("rental_verifications").select(cols).eq("crew_slug", slug).limit(1000),
+  );
+  // Labels for every chat id the ledger mentions (operators + stamp authors).
+  const chatIds = new Set<string>();
+  for (const row of res.rows) {
+    if (row.operator_chat_id) chatIds.add(String(row.operator_chat_id));
+    const payout = parsePayoutInfo(row.payout);
+    if (payout.operator?.by) chatIds.add(String(payout.operator.by));
+  }
+  const usersMap = await loadUsersMap([...chatIds]);
+  return buildCrewPayoutLedger(res.rows, {
+    crewSlug: slug,
+    labelOf: (chatId) => labelFromUsersMap(usersMap, chatId),
+    payoutColumnMissing: res.payoutColumnMissing,
+  });
 }

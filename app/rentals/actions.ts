@@ -772,25 +772,15 @@ export async function initiateTelegramRentalPhotoUpload(
             return { success: false, error: 'Только арендатор может отправлять фото.' };
         }
 
-        if (photoType === 'start' && !['pending_confirmation', 'confirmed'].includes(rental.status)) {
-            // Allow 'active' status too if within ±2 hours of agreed_start_date.
-            // Operator might have flipped to active at handoff but still wants to
-            // capture pre-rental photos (passport, odometer, damage).
-            // Window is ±2h to account for timezone mismatches (UTC vs MSK).
-            if (rental.status === 'active' && rental.agreed_start_date) {
-                const startTime = new Date(rental.agreed_start_date).getTime();
-                const now = Date.now();
-                const TWO_HOURS = 2 * 60 * 60 * 1000;
-                if (Math.abs(now - startTime) >= TWO_HOURS) {
-                    return { success: false, error: 'Фото ДО доступно только до выдачи или в течение 2 часов после начала аренды.' };
-                }
-            } else {
-                return { success: false, error: 'Фото ДО доступно только до подтверждения получения.' };
-            }
+        // Task 120 (boss): the 2h window is ditched — «ДО» photos are allowed
+        // at ANY time (pending_confirmation / confirmed / active / completed).
+        if (photoType === 'start' && ['cancelled'].includes(rental.status)) {
+            return { success: false, error: 'Аренда отменена — фото недоступны.' };
         }
 
-        if (photoType === 'end' && rental.status !== 'active') {
-            return { success: false, error: 'Фото ПОСЛЕ доступно только для активной аренды.' };
+        // «ПОСЛЕ» photos: active or completed (retro-adding return photos OK).
+        if (photoType === 'end' && !['active', 'completed'].includes(rental.status)) {
+            return { success: false, error: 'Фото ПОСЛЕ доступно для активной или закрытой аренды.' };
         }
 
         const { error: upsertError } = await supabaseAdmin.from('user_states').upsert({
@@ -1520,7 +1510,7 @@ export async function confirmVehicleReturn(
         // ── Fetch rental + vehicle for closure flow ────────────────────────────
         const { data: rental, error: fetchError } = await supabaseAdmin
             .from('rentals')
-            .select('rental_id, owner_id, user_id, crew_id, vehicle_id, metadata, total_cost, agreed_end_date, agreed_start_date, vehicle:cars(make, model, id, specs)')
+            .select('rental_id, owner_id, user_id, crew_id, vehicle_id, metadata, total_cost, agreed_end_date, agreed_start_date, start_photo_count, end_photo_count, vehicle:cars(make, model, id, specs)')
             .eq('rental_id', rentalId)
             .maybeSingle();
         if (fetchError || !rental) return { success: false, error: "Аренда не найдена." };
@@ -1954,11 +1944,21 @@ export async function confirmVehicleReturn(
             const { grantRentalClosureAchievements } = await import(
                 "@/app/franchize/server-actions/rental-achievements"
             );
+            // Task 117: the full documentation picture — odometer BEFORE comes
+            // from the rental metadata (written at pickup freeze), photo counts
+            // from the rental columns. «Идеальная» = пробег до/после + фото до/после.
+            const closureMeta = (rental.metadata || {}) as Record<string, unknown>;
             await grantRentalClosureAchievements({
                 rentalId,
                 actingUserId: userId,
                 closureData: {
                     odometerAfter: closureData?.odometerAfter ?? null,
+                    odometerBefore:
+                        typeof closureMeta.odometer_before === "number"
+                            ? (closureMeta.odometer_before as number)
+                            : null,
+                    startPhotoCount: (rental as any).start_photo_count ?? null,
+                    endPhotoCount: (rental as any).end_photo_count ?? null,
                     depositReturned: closureData?.depositReturned ?? null,
                     damageLevel:
                         (closureData as any)?.damageLevel ?? null,
