@@ -133,6 +133,39 @@ export interface RentalVerificationSnapshot {
   };
   /** Task 117: bike main photo (cars.image_url) — sent as a preview photo. */
   bikePhotoUrl?: string | null;
+  /**
+   * Task 123 — photo presence frozen at request time: how many «ДО»/«ПОСЛЕ»
+   * shots the rental carries (metadata counts + pickup_freeze), plus the
+   * canonical URL of each state when one exists (start_photo_url /
+   * end_photo_url, fallback pickup_freeze.photo_urls[0]). Optional — rows
+   * created before task 123 degrade gracefully.
+   */
+  photos?: {
+    before: number;
+    after: number;
+    beforeUrl?: string | null;
+    afterUrl?: string | null;
+    /**
+     * Task 123 (durable part): storage paths of the LATEST «ДО»/«ПОСЛЕ» shot
+     * in the private `rental-photos` bucket (rental_photos table). A signed
+     * URL is generated at SEND time (sendVerificationStatePhoto) — paths
+     * never expire, signed links do, so resends months later still work.
+     */
+    beforePath?: string | null;
+    afterPath?: string | null;
+  } | null;
+  /**
+   * Task 123 — NO PROBLEMO verdict frozen at request time (same pattern as
+   * the audit block): when «no_problemo», the DM collapses the full расчёт
+   * into a Telegram <blockquote expandable> under a calm 🟢 headline with
+   * these ✅ checks. «normal» keeps the rich task-117 layout. Optional —
+   * pre-task-123 rows degrade to normal.
+   */
+  reasonability?: {
+    mode: "no_problemo" | "normal";
+    checks: string[];
+    checkedAt?: string;
+  } | null;
 }
 
 export interface RentalVerificationRow {
@@ -388,6 +421,21 @@ export function auditGradeLine(audit?: { grade: "fine" | "almost" | "sus"; notes
 }
 
 /**
+ * Task 123 — the 📸 presence line: how many «ДО»/«ПОСЛЕ» shots the rental
+ * carries. null when the rental has no photo data at all (old rows).
+ */
+export function photoPresenceLine(photos?: RentalVerificationSnapshot["photos"]): string | null {
+  if (!photos) return null;
+  const before = Math.max(0, Math.trunc(Number(photos.before) || 0));
+  const after = Math.max(0, Math.trunc(Number(photos.after) || 0));
+  if (before <= 0 && after <= 0) return null;
+  const parts: string[] = [];
+  if (before > 0) parts.push(`${before} до`);
+  if (after > 0) parts.push(`${after} после`);
+  return `📸 Фото: ${parts.join(" · ")}`;
+}
+
+/**
  * Builds the HTML summary both parties receive. Same numbers as the profile
  * TL;DR rows (техника · экип · нац. split) — the operator recognizes the
  * format, the owner gets the audit trail (damage, penalty, deposit, notes).
@@ -398,6 +446,14 @@ export function auditGradeLine(audit?: { grade: "fine" | "almost" | "sus"; notes
  * recipient can press ✅ from the message alone, without digging for
  * coefficients. Everything degrades to the old compact view for rows frozen
  * before task117 (optional fields absent).
+ *
+ * Task 123 — NO PROBLEMO layout: when snapshot.reasonability.mode is
+ * «no_problemo» (audit fine + no penalty + no damage + formula frozen), the
+ * message LEADS with a calm 🟢 headline + the short ✅ checklist, and the
+ * whole расчёт (commission breakdown + formula + audit + attribution +
+ * flags) collapses into a Telegram <blockquote expandable> — the native
+ * collapsible spoiler. The rich layout stays for every rental worth a
+ * second look, so «normal» rows visually EARN the extra reading time.
  */
 export function formatVerificationSummary(params: {
   crewName: string | null;
@@ -429,14 +485,42 @@ export function formatVerificationSummary(params: {
   }
   lines.push(`💵 Сумма аренды (клиент): <b>${formatRubVerify(s.totalCost)}</b>`, ``);
 
-  lines.push(`📊 <b>Комиссия оператора: ${formatRubVerify(s.total)}</b>`);
-  lines.push(`  • техника (${escapeVerifyHtml(s.rentalCategoryLabel)}): +${formatRubVerify(s.base)}`);
-  lines.push(
+  // ── Task 123: NO PROBLEMO compact layout ──
+  // The расчёт below (commission + formula + audit + attribution + flags)
+  // becomes an expandable spoiler; the calm verdict leads instead.
+  const noProblemo = s.reasonability?.mode === "no_problemo";
+  if (noProblemo) {
+    lines.push(`🟢 <b>No problemo</b> — все проверки сошлись, можно одним глазом:`);
+    for (const c of s.reasonability?.checks || []) lines.push(`  ✅ ${escapeVerifyHtml(c)}`);
+    const photoLine = photoPresenceLine(s.photos);
+    if (photoLine) lines.push(photoLine);
+    // A return comment is context, not a problem — keep it OUT of the
+    // spoiler so the reader sees it without expanding anything.
+    if (s.returnNotes) lines.push(`📝 комментарий: ${escapeVerifyHtml(s.returnNotes)}`);
+  }
+
+  if (noProblemo) lines.push(``, `🧾 <b>Детали расчёта</b> — свёрнуты, развернуть можно тапом:`);
+
+  const detail: string[] = [];
+  if (noProblemo) {
+    detail.push(`📊 <b>Комиссия оператора: ${formatRubVerify(s.total)}</b>`);
+  } else {
+    lines.push(`📊 <b>Комиссия оператора: ${formatRubVerify(s.total)}</b>`);
+  }
+  // Task 123 router: in the compact layout every расчёт line below lands in
+  // the spoiler (detail) instead of the visible body (lines). Variadic —
+  // some blocks push a blank separator + content in one call.
+  const out = (...ls: string[]): void => {
+    if (noProblemo) detail.push(...ls);
+    else lines.push(...ls);
+  };
+  out(`  • техника (${escapeVerifyHtml(s.rentalCategoryLabel)}): +${formatRubVerify(s.base)}`);
+  out(
     s.equipment > 0
       ? `  • экипировка${s.equipmentFlags ? ` (${escapeVerifyHtml(s.equipmentFlags)})` : ""}: +${formatRubVerify(s.equipment)}`
       : `  • экипировка: нет`,
   );
-  lines.push(
+  out(
     s.overprice > 0
       ? `  • наценка (${s.overpricePercent}%): +${formatRubVerify(s.overprice)}`
       : `  • наценка: нет`,
@@ -445,39 +529,39 @@ export function formatVerificationSummary(params: {
   // ── Task 117: «откуда цифры» — the full formula ──
   const f = s.formula;
   if (f && !f.fallback && f.standardTotal > 0) {
-    lines.push(``, `🧮 <b>Откуда цифры</b>`);
+    out(``, `🧮 <b>Откуда цифры</b>`);
     if (f.bikeHours > 0 && f.bikeDays === 0) {
-      lines.push(`  🏍 мот: ${f.bikeHours} ч × ${formatRubVerify(f.bikeRate || 0)} = ${formatRubVerify(f.bikeStandard)}`);
+      out(`  🏍 мот: ${f.bikeHours} ч × ${formatRubVerify(f.bikeRate || 0)} = ${formatRubVerify(f.bikeStandard)}`);
     } else {
-      lines.push(
+      out(
         `  🏍 мот: ${f.bikeDays} ${f.bikeDays === 1 ? "сутки" : "суток"} × ${formatRubVerify(f.bikeRate || 0)}${
           f.bikeTierLabel ? ` (${escapeVerifyHtml(f.bikeTierLabel)})` : ""
         } = ${formatRubVerify(f.bikeStandard)}`,
       );
     }
     if (f.gearLines.length > 0) {
-      lines.push(`  🧰 экип по прайсу: ${f.gearLines.map((l) => escapeVerifyHtml(l)).join(" · ")} = ${formatRubVerify(f.gearStandard)}`);
+      out(`  🧰 экип по прайсу: ${f.gearLines.map((l) => escapeVerifyHtml(l)).join(" · ")} = ${formatRubVerify(f.gearStandard)}`);
       // Task 118: the day ladder for multi-day gear (1st day full, then half).
       if (f.gearDaysLine) {
         const label = f.gearDaysLabel || (f.gearDays && f.gearDays > 1 ? `${f.gearDays} суток` : "");
-        lines.push(`  ↳ экип за ${escapeVerifyHtml(label)}: ${escapeVerifyHtml(f.gearDaysLine)}`);
+        out(`  ↳ экип за ${escapeVerifyHtml(label)}: ${escapeVerifyHtml(f.gearDaysLine)}`);
       }
     } else {
-      lines.push(`  🧰 экип по прайсу: нет`);
+      out(`  🧰 экип по прайсу: нет`);
     }
-    lines.push(`  ↳ эталон: ${formatRubVerify(f.standardTotal)} · клиент: ${formatRubVerify(f.clientTotal)} → наценка ${formatRubVerify(f.markup)}`);
+    out(`  ↳ эталон: ${formatRubVerify(f.standardTotal)} · клиент: ${formatRubVerify(f.clientTotal)} → наценка ${formatRubVerify(f.markup)}`);
     if (s.overprice > 0) {
-      lines.push(`  ↳ наценка: ${formatRubVerify(f.markup)} × ${f.overpricePercent}% = ${formatRubVerify(s.overprice)}`);
+      out(`  ↳ наценка: ${formatRubVerify(f.markup)} × ${f.overpricePercent}% = ${formatRubVerify(s.overprice)}`);
     }
     // Task 118: the equipment commission ladder («(200 + 100 + 100) × 3 ед. = 1 200 ₽»).
     if (f.equipCommLine && s.equipment > 0) {
-      lines.push(`  ↳ комиссия за экип: ${escapeVerifyHtml(f.equipCommLine)} = ${formatRubVerify(s.equipment)}`);
+      out(`  ↳ комиссия за экип: ${escapeVerifyHtml(f.equipCommLine)} = ${formatRubVerify(s.equipment)}`);
     }
     const followupNote =
       Number(f.equipFollowupUnit) > 0 && Number(f.equipmentUnitCoef) !== Number(f.equipFollowupUnit)
         ? ` (со 2-х суток ${formatRubVerify(Number(f.equipFollowupUnit))}/ед)`
         : "";
-    lines.push(
+    out(
       `  📜 коэф.: мот ${formatRubVerify(f.baseCoef)}/аренда · экип ${formatRubVerify(f.equipmentUnitCoef)}/ед${followupNote} · наценка ${f.overpricePercent}%`,
     );
     // Task 120: the short-rental rule is part of the legend — the halved
@@ -488,11 +572,11 @@ export function formatVerificationSummary(params: {
     // operator nor the owner received the сверка at all (row was already
     // persisted → silent death after the insert). Always escape: `&lt;`.
     if (f.shortRental) {
-      lines.push(
+      out(
         `  ↳ аренда &lt; 24 ч — комиссия пополам: мот ${formatRubVerify(f.baseCoef)} → ${formatRubVerify(Math.round(f.baseCoef / 2))} · экип ${formatRubVerify(f.equipmentUnitCoef)} → ${formatRubVerify(Math.round(f.equipmentUnitCoef / 2))}/ед`,
       );
     }
-    lines.push(
+    out(
       `  ℹ️ экип клиенту: 1-е сутки полная цена, дальше — половина; мот: тариф зависит от длительности, комиссия — фикс за аренду${f.shortRental ? "; аренда меньше суток — комиссия пополам" : ""}`,
     );
   }
@@ -500,7 +584,7 @@ export function formatVerificationSummary(params: {
   // ── Task 117: the operator's score (копилка) ──
   if (params.operatorScore) {
     const opLabel = escapeVerifyHtml(labelFromUsersMap(params.usersMap, params.operatorChatId || s.attribution?.createdByChatId));
-    lines.push(
+    out(
       ``,
       `🏅 Счёт ${opLabel}: <b>${formatRubVerify(params.operatorScore.sum)}</b> подтверждено (${params.operatorScore.count} ар.)`,
     );
@@ -508,7 +592,7 @@ export function formatVerificationSummary(params: {
 
   // ── Task 117: audit grade (frozen at request) ──
   const auditLine = auditGradeLine(s.audit);
-  if (auditLine) lines.push(auditLine);
+  if (auditLine) out(auditLine);
 
   const attrs = [
     s.attribution.createdByChatId
@@ -521,7 +605,7 @@ export function formatVerificationSummary(params: {
       ? `принял ${escapeVerifyHtml(labelFromUsersMap(params.usersMap, s.attribution.returnedByChatId))}`
       : "",
   ].filter(Boolean);
-  if (attrs.length) lines.push(``, `👥 ${attrs.join(" · ")}`);
+  if (attrs.length) out(``, `👥 ${attrs.join(" · ")}`);
 
   const flags: string[] = [];
   if (s.depositReturned === true) flags.push("💰 депозит: возвращён");
@@ -534,9 +618,22 @@ export function formatVerificationSummary(params: {
     );
   }
   if (s.damageNotes) flags.push(`🩹 ущерб: ${escapeVerifyHtml(s.damageNotes)}`);
-  if (s.returnNotes) flags.push(`📝 комментарий: ${escapeVerifyHtml(s.returnNotes)}`);
-  if (flags.length) lines.push(``, ...flags);
+  if (flags.length) out(``, ...flags);
 
+  if (!noProblemo) {
+    // Task 123: the photo presence line lives right before the status note in
+    // the rich layout (in the compact one it is already up top).
+    const photoLine = photoPresenceLine(s.photos);
+    if (photoLine) lines.push(``, photoLine);
+    lines.push(``, params.statusNote);
+    return lines.join("\n");
+  }
+
+  // ── Task 123: assemble the collapsed spoiler ──
+  // <blockquote expandable> is Telegram's native collapsible section: the
+  // text inside renders folded until the reader taps it. The calculation is
+  // still fully there (audit trail!) — it just stops shouting.
+  lines.push(``, `<blockquote expandable>${detail.join("\n")}</blockquote>`);
   lines.push(``, params.statusNote);
   return lines.join("\n");
 }
@@ -582,6 +679,159 @@ export function verificationStatusNote(params: {
     return `Ждёт подтверждения: ${own} (владелец) уже за, осталось ${op} (оператор).`;
   }
   return `Ждёт подтверждения: ${op} (оператор) и ${own} (владелец). После двух ✅ аренда помечается как проверенная.`;
+}
+
+// ── Task 122 — the warm half of the money game ─────────────────────────────
+//
+// Boss (2026-10-21): «splitting the revenue is viscerally aggressive — let's
+// fix that; gamify the сверка experience». The cold machine (state machine,
+// freezes, optimistic locks) already exists; these helpers add the pleasant
+// layer on top: a warm closer under the done-DM, a speed flex, an explicit
+// ladder to the NEXT achievement, and a «next up» pointer so finishing one
+// сверка flows straight into the next one. All PURE — the server half wires
+// them into the done-DM and the payout hub.
+
+/** Russian plural for counts (1 сверку / 2 сверки / 5 сверок). */
+export function ruPlural(n: number, one: string, few: string, many: string): string {
+  const a = Math.abs(Math.trunc(n)) % 100;
+  const b = a % 10;
+  if (a > 10 && a < 20) return many;
+  if (b > 1 && b < 5) return few;
+  if (b === 1) return one;
+  return many;
+}
+
+/**
+ * Rotating warm closers for the «verified» DM. Seed = rental_id — stable per
+ * rental (no flicker on resend), varied across rentals.
+ */
+const WARM_CLOSERS = [
+  "Деньги поделены — экипаж в плюсе 😌",
+  "Честный сплит быстрее любого спора 💪",
+  "Ещё одна аренда закрыта красиво ✨",
+  "Сработались — так держать 🤝",
+  "Прозрачные числа — спокойный конец месяца 🌙",
+  "Кто сверяет сразу — тот в конце месяца отдыхает 🏖",
+  "Команда, которая сверяется вместе, растёт вместе 🚀",
+];
+
+export function warmCloserLine(seed: string | number | null | undefined): string {
+  const s = String(seed ?? "");
+  let h = 0;
+  for (let i = 0; i < s.length; i += 1) h = (h * 31 + s.charCodeAt(i)) >>> 0;
+  return WARM_CLOSERS[h % WARM_CLOSERS.length];
+}
+
+/**
+ * ⚡️ Speed flex under the done-DM when both sides confirmed within an hour —
+ * the same 60-min window the verify_speedy achievement rewards. null when
+ * the timestamps are unusable or the confirm took longer.
+ */
+export function verificationSpeedLine(
+  requestedAtIso: string | null | undefined,
+  verifiedAtIso: string | null | undefined,
+): string | null {
+  const from = Date.parse(String(requestedAtIso || ""));
+  const to = Date.parse(String(verifiedAtIso || ""));
+  if (!Number.isFinite(from) || !Number.isFinite(to) || to <= from) return null;
+  // floor, not round (review #6): 59.9 мин must still flex («59 минут»), the
+  // same boundary isSpeedyConfirm uses — the line can never contradict the
+  // achievement that just fired.
+  const mins = Math.floor((to - from) / 60000);
+  if (mins < 1) return "⚡️ Молниеносно: сверка заняла меньше минуты";
+  if (mins >= 60) return null;
+  return `⚡️ Молниеносно: сверка заняла ${mins} ${ruPlural(mins, "минуту", "минуты", "минут")}`;
+}
+
+/**
+ * 🏆 The ladder to the NEXT verification achievement (names mirror the
+ * profile-actions catalog: verify_10 «Безупречная десятка 🧾», verify_50
+ * «Полсотни рукопожатий 💯», verify_100 «Сотня без споров 🎖» — task 123).
+ * null once the ladder is finished — the line would only be noise for a
+ * 100× veteran.
+ */
+export function verifyProgressLine(verifiedCount: number): string | null {
+  const c = Math.max(0, Math.trunc(verifiedCount) || 0);
+  const line = (target: number, title: string): string =>
+    `🏆 До достижения «${title}» — ещё ${target - c} ${ruPlural(target - c, "сверку", "сверки", "сверок")}`;
+  if (c < 10) return line(10, "Безупречная десятка 🧾");
+  if (c < 50) return line(50, "Полсотни рукопожатий 💯");
+  // Task 123 (boss: «verify_100 tier») — the ladder keeps running past 50.
+  if (c < 100) return line(100, "Сотня без споров 🎖");
+  return null;
+}
+
+// ── Task 124 — the no-problemo STREAK (boss: «crank it to 13») ───────────────
+//
+// A row is streak-clean when its frozen snapshot carries
+// reasonability.mode === "no_problemo" (task 123: расчёт сошёлся, депозит
+// возвращён, без ущерба и штрафов). The streak = how many NEWEST verified
+// rows in a row are clean. Anything else — normal mode, missing reasonability
+// (old pre-task123 rows: unknown ≠ clean), disputed history — stops the walk.
+//
+// The 13-streak achievement («🕶️ 13 no problemo подряд») is granted in
+// grantVerificationAchievements; this pure half is unit-testable and shared
+// with the done-DM streak line.
+
+/** Minimal row shape the streak walk needs (newest-first order is the caller's job). */
+export interface StreakRow {
+  snapshot?: { reasonability?: { mode?: string | null } | null } | null;
+}
+
+/**
+ * Count consecutive newest-first clean rows. `rows[0]` = the most recent
+ * verified сверка. Returns 0 when the newest row isn't clean.
+ */
+export function computeNoProblemoStreak(rows: Array<StreakRow | null | undefined>): number {
+  let streak = 0;
+  for (const row of rows) {
+    const mode = row?.snapshot?.reasonability?.mode;
+    if (mode !== "no_problemo") break;
+    streak += 1;
+  }
+  return streak;
+}
+
+/**
+ * 🕶️ The streak line for the done-DM. Quiet below 3 (a fresh account would
+ * otherwise see noise on every first confirm); from 3 it counts up; at 13 it
+ * celebrates and keeps counting (14, 15…) — the flex never expires.
+ */
+export function streakProgressLine(streak: number): string | null {
+  const s = Math.max(0, Math.trunc(streak) || 0);
+  if (s < 3) return null;
+  if (s < 13) {
+    return `🕶️ Стрик no problemo: ${s} подряд — до «13 no problemo подряд» ещё ${13 - s}`;
+  }
+  return `🕶️ ${s} no problemo подряд — стиль. Респект.`;
+}
+
+/** What the «⏭ Следующая сверка» pointer needs to phrase itself. */
+export interface NextUpInfo {
+  bikeName: string;
+  amountRub: number;
+  status: RentalVerificationStatus;
+  /** The viewer is the operator party of THAT row. */
+  viewerIsOperator: boolean;
+  /** The viewer is the owner party of THAT row. */
+  viewerIsOwner: boolean;
+}
+
+/** ⏭ The «next up» pointer line for the done-DM. */
+export function nextUpLine(info: NextUpInfo): string {
+  const bike = escapeVerifyHtml(String(info.bikeName || "аренда"));
+  const rub = formatRubVerify(Math.max(0, Number(info.amountRub) || 0));
+  let waiting: string;
+  if (info.status === "operator_confirmed") {
+    waiting = info.viewerIsOwner ? "осталось ваше ✅" : "осталось ✅ владельца";
+  } else if (info.status === "owner_confirmed") {
+    waiting = info.viewerIsOperator ? "осталось ваше ✅" : "осталось ✅ оператора";
+  } else if (info.viewerIsOperator || info.viewerIsOwner) {
+    waiting = "ждёт вашего ✅";
+  } else {
+    waiting = "ждёт подтверждения сторон";
+  }
+  return `⏭ Следующая сверка: ${bike} · ${rub} — ${waiting}`;
 }
 
 // ── Negotiation («дил», task 106) — split editor ──────────────────────────────────

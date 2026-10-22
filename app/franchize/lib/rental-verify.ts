@@ -55,7 +55,7 @@ import {
 } from "@/lib/salary-coefficients-shared";
 import { resolveRentalOperator, type ShiftLike } from "@/app/franchize/lib/operator-attribution";
 // Task 114: per-rental audit grade computed at request time (pure module).
-import { buildAuditStamp, computeRentalAuditGrade } from "@/app/franchize/lib/rental-audit";
+import { buildAuditStamp, computeRentalAuditGrade, computeVerificationReasonability } from "@/app/franchize/lib/rental-audit";
 // Task 117: the operator score uses the SAME commission math as the payout hub.
 import { commissionOf } from "./rental-payout-core";
 import {
@@ -70,6 +70,7 @@ import {
   auditGradeLine,
   bikeTierLabelRu,
   clearDraft,
+  computeNoProblemoStreak,
   declineOpenProposal,
   disputeEditorKeyboard,
   escapeVerifyHtml,
@@ -79,6 +80,7 @@ import {
   formatRubVerify,
   formatVerificationSummary,
   labelFromUsersMap,
+  nextUpLine,
   otherPartyChatId,
   parseNegotiation,
   parseProposalCallback,
@@ -93,15 +95,21 @@ import {
   snapshotSplitOf,
   splitTotal,
   startDraft,
+  streakProgressLine,
   verificationKeyboard,
+  verificationSpeedLine,
   verificationStatusNote,
+  verifyProgressLine,
+  warmCloserLine,
   withdrawOpenProposal,
   type InlineButton,
   type NegotiationState,
   type OpenProposal,
   type RentalVerificationRow,
   type RentalVerificationSnapshot,
+  type RentalVerificationStatus,
   type SplitPartKey,
+  type StreakRow,
   type VerificationActor,
   type VerificationBrief,
 } from "./rental-verify-core";
@@ -164,6 +172,9 @@ export async function computeRentalVerificationSnapshot(params: {
     agreed_end_date: string | null;
     created_by_operator_chat_id?: string | null;
     created_at?: string | null;
+    /** Task 123: photo counters — optional so old callers keep compiling. */
+    start_photo_count?: number | null;
+    end_photo_count?: number | null;
     vehicle: {
       id?: string;
       make?: string | null;
@@ -236,6 +247,65 @@ export async function computeRentalVerificationSnapshot(params: {
     gearDays,
   );
   const bikeImage = typeof (vehicle as any)?.image_url === "string" ? (vehicle as any).image_url.trim() : "";
+  // ── Task 123: photo presence frozen with the numbers ──
+  // Counts: the rental columns are the truth the return page shows; the
+  // metadata sources (pickup_freeze.photo_urls, start/end_photo_url) fill the
+  // gaps when a column was not maintained. Canonical URL per state: the
+  // renter-uploaded «ДО»/«ПОСЛЕ» shot wins, otherwise the first pickup-freeze
+  // photo represents «ДО». null (field absent) when a rental has neither —
+  // the DM then simply shows no photo line.
+  const freezePhotos = Array.isArray(freeze?.photo_urls)
+    ? (freeze!.photo_urls as unknown[]).filter((u): u is string => typeof u === "string" && /^https:\/\//i.test(u.trim()))
+    : [];
+  const startPhotoUrl =
+    typeof meta.start_photo_url === "string" && /^https:\/\//i.test(meta.start_photo_url.trim())
+      ? meta.start_photo_url.trim()
+      : null;
+  const endPhotoUrl =
+    typeof meta.end_photo_url === "string" && /^https:\/\//i.test(meta.end_photo_url.trim())
+      ? meta.end_photo_url.trim()
+      : null;
+  const photosBefore = Math.max(
+    Number(rental.start_photo_count) || 0,
+    freezePhotos.length,
+    startPhotoUrl ? 1 : 0,
+  );
+  const photosAfter = Math.max(Number(rental.end_photo_count) || 0, endPhotoUrl ? 1 : 0);
+  // Task 123 (durable): the latest «ДО»/«ПОСЛЕ» storage paths from
+  // rental_photos — the private bucket serves via SIGNED urls, so the path is
+  // what gets frozen; the signed link is minted at send time and never stale.
+  let beforePath: string | null = null;
+  let afterPath: string | null = null;
+  if (photosBefore > 0 || photosAfter > 0) {
+    try {
+      const { data: photoRows } = await supabaseAdmin
+        .from("rental_photos")
+        .select("photo_type, storage_path, created_at")
+        .eq("rental_id", rental.rental_id)
+        .in("photo_type", ["start", "end"])
+        .order("created_at", { ascending: false })
+        .limit(20);
+      for (const p of (photoRows || []) as Array<{ photo_type: string; storage_path: string }>) {
+        if (!p.storage_path) continue;
+        if (p.photo_type === "end" && !afterPath) afterPath = p.storage_path;
+        if (p.photo_type === "start" && !beforePath) beforePath = p.storage_path;
+        if (beforePath && afterPath) break;
+      }
+    } catch {
+      // non-fatal: paths are an upgrade — counts and metadata URLs still work
+    }
+  }
+  const photosBlock =
+    photosBefore > 0 || photosAfter > 0
+      ? {
+          before: photosBefore,
+          after: photosAfter,
+          beforeUrl: startPhotoUrl || freezePhotos[0] || null,
+          afterUrl: endPhotoUrl,
+          beforePath,
+          afterPath,
+        }
+      : null;
   return {
     bikeName: `${vehicle?.make || ""} ${vehicle?.model || ""}`.trim(),
     rentalCategory: categories.rental,
@@ -312,6 +382,7 @@ export async function computeRentalVerificationSnapshot(params: {
       overpricePercent: config.overpricePercent,
     },
     bikePhotoUrl: bikeImage.startsWith("http") ? bikeImage : null,
+    photos: photosBlock,
   };
 }
 
@@ -370,6 +441,13 @@ export async function requestRentalVerification(params: {
   rentalId: string;
   actorChatId: string;
   source: string;
+  /**
+   * Task 124 — the closure modal's «✅ расчёт сходится» checkbox (checked by
+   * default). true → a calm «оператор сверил расчёт при закрытии» check rides
+   * in the snapshot; false → the row is forced to normal layout with an
+   * «оператор не согласился» warning so the second party looks twice.
+   */
+  operatorAgreed?: boolean;
 }): Promise<{ sent: boolean; reason?: string }> {
   try {
     // ── Fetch the closed rental + vehicle ──
@@ -382,6 +460,7 @@ export async function requestRentalVerification(params: {
         deposit_amount, deposit_returned,
         created_by_operator_chat_id, created_at,
         requested_start_date, requested_end_date, agreed_start_date, agreed_end_date,
+        start_photo_count, end_photo_count,
         vehicle:cars(id, make, model, specs, daily_price, type, crew_id, is_test_result, image_url)
       `)
       .eq("rental_id", params.rentalId)
@@ -439,6 +518,8 @@ export async function requestRentalVerification(params: {
         agreed_end_date: rental.agreed_end_date,
         created_by_operator_chat_id: rental.created_by_operator_chat_id,
         created_at: rental.created_at,
+        start_photo_count: (rental as any).start_photo_count,
+        end_photo_count: (rental as any).end_photo_count,
         vehicle,
       },
       crewId: rental.crew_id,
@@ -482,6 +563,48 @@ export async function requestRentalVerification(params: {
     } catch (auditErr) {
       // Non-fatal: an ungraded row only loses the bulk sweep shortcut.
       logger.warn(`[rental-verify] audit grade failed for ${rental.rental_id} (non-fatal):`, auditErr);
+    }
+
+    // ── Task 123: NO PROBLEMO verdict — frozen with the numbers ──
+    // The audit grade + the last-mile checks (penalty/damage/deposit) decide
+    // the DM layout NOW, at request time: clean rentals collapse their расчёт
+    // into a Telegram expandable spoiler under the 🟢 headline. Frozen like
+    // the audit block so a resend months later shows the SAME layout the
+    // parties first saw.
+    try {
+      const reasonability = computeVerificationReasonability({
+        audit: {
+          grade: snapshot.audit?.grade ?? "almost",
+          notes: snapshot.audit?.notes ?? ["аудит не выполнен"],
+        },
+        markup: Number.isFinite(Number(snapshot.formula?.markup)) ? Number(snapshot.formula?.markup) : null,
+        total: Number(snapshot.totalCost) || 0,
+        penaltyAmount: Number(snapshot.penalty?.amount) || 0,
+        damageNotes: snapshot.damageNotes,
+        depositReturned: snapshot.depositReturned,
+        depositAmount: Number(rental.deposit_amount) || 0,
+        hasFormula: !!snapshot.formula && snapshot.formula.standardTotal > 0,
+      });
+      snapshot.reasonability = { ...reasonability, checkedAt: nowIso };
+      // Task 124 — the operator's «✅ расчёт сходится» vote from the closure
+      // modal. Agreement adds a check line (any layout); disagreement forces
+      // the rich layout with a warning line — the owner must look twice.
+      if (params.operatorAgreed === true) {
+        snapshot.reasonability = {
+          mode: snapshot.reasonability?.mode ?? "normal",
+          checks: [...(snapshot.reasonability?.checks || []), "оператор сверил расчёт при закрытии"],
+          checkedAt: nowIso,
+        };
+      } else if (params.operatorAgreed === false) {
+        snapshot.reasonability = {
+          mode: "normal",
+          checks: ["оператор снял отметку «расчёт ок» при закрытии — проверьте внимательнее"],
+          checkedAt: nowIso,
+        };
+      }
+    } catch (reasonErr) {
+      // Non-fatal: an ungraded layout just means the rich DM stays.
+      logger.warn(`[rental-verify] reasonability failed for ${rental.rental_id} (non-fatal):`, reasonErr);
     }
 
     const { data: crewRow } = await supabaseAdmin
@@ -563,6 +686,9 @@ export async function requestRentalVerification(params: {
         // cap at 1024 chars, too tight for the rich formula text), then the
         // full summary. Photo failure is cosmetic — the summary must land.
         await sendVerificationBikePhoto(chatId, snapshot.bikePhotoUrl, snapshot.bikeName);
+        // Task 123: the rental's own ДО/ПОСЛЕ state shot (one photo, see
+        // sendVerificationStatePhoto) + photo counts live in the summary.
+        await sendVerificationStatePhoto(chatId, snapshot.photos);
         await sendComplexMessage(chatId, summary, keyboard, { parseMode: "HTML", keyboardType: "inline" });
       } catch (e) {
         logger.warn(`[rental-verify] summary send failed for ${chatId} (rental ${rental.rental_id}):`, e);
@@ -573,13 +699,15 @@ export async function requestRentalVerification(params: {
     // Boss: «upon closing rental notification for verification is sent to
     // crew owner, crew admins». Task 118 (boss: «show buttons to admin as
     // well»): the staff copy carries the SAME ✅/⚠️ keyboard — crew staff act
-    // as «admin» (an admin ✅ verifies instantly, ⚠️ joins the negotiation).
+    // as «admin» (an admin ✅ stamps the administration's voice; the final
+    // word stays with the owner party — task 120; ⚠️ joins the negotiation).
     try {
       const ccSent = await ccVerificationToCrewStaff({
         crewSlug,
         rentalId: rental.rental_id,
         summary,
         bikePhotoUrl: snapshot.bikePhotoUrl,
+        statePhotos: snapshot.photos,
         keyboard: keyboard as unknown as InlineButton[][],
         exclude: [
           operatorChatId,
@@ -650,6 +778,213 @@ interface PayoutSourceRowLike {
 }
 
 /**
+ * Task 122 — lifetime verified count for ONE viewer (both party roles).
+ * Feeds the 🏆 progress line («до „Безупречная десятка" ещё N сверк») in the
+ * done-DM. Same head-count query grantVerificationAchievements uses.
+ */
+async function countVerifiedFor(chatId: string | null | undefined): Promise<number> {
+  const viewer = chatId ? String(chatId) : "";
+  if (!viewer) return 0;
+  try {
+    const { count, error } = await supabaseAdmin
+      .from("rental_verifications")
+      .select("rental_id", { count: "exact", head: true })
+      .eq("status", "verified")
+      .or(`operator_chat_id.eq.${viewer},owner_chat_id.eq.${viewer}`);
+    if (error) return 0;
+    return count || 0;
+  } catch {
+    return 0;
+  }
+}
+
+export interface NextVerificationPointer {
+  rentalId: string;
+  status: RentalVerificationStatus;
+  operatorChatId: string | null;
+  ownerChatId: string | null;
+  bikeName: string;
+  amountRub: number;
+  /** Own crew of THAT row — the 👀 deeplink must use ITS bot (review #3). */
+  crewSlug: string | null;
+}
+
+/**
+ * Task 122 — the NEXT open сверка for this viewer: «notification can contain
+ * quick "next" latest unverified rental to maybe look at» (boss 2026-10-21).
+ * Party rows first, newest request wins (memory is freshest — the season
+ * stats list makes the same choice). When the viewer has no personal open
+ * rows but IS crew staff, fall back to the crew's newest open row: the owner
+ * always gets a pointer, even for rentals where he is not the owner party.
+ * Strictly non-fatal — any error → null (no pointer line).
+ */
+export async function findNextVerificationFor(params: {
+  chatId: string;
+  crewSlug: string | null | undefined;
+  excludeRentalId?: string | null;
+}): Promise<NextVerificationPointer | null> {
+  const viewer = String(params.chatId || "");
+  if (!viewer) return null;
+  const exclude = params.excludeRentalId ? String(params.excludeRentalId) : null;
+  const pick = (rows: any[] | null): NextVerificationPointer | null => {
+    const row = (rows || [])[0] as any;
+    if (!row?.rental_id) return null;
+    const snap = (row.snapshot || {}) as Record<string, unknown>;
+    const total = Number(snap.total);
+    return {
+      rentalId: String(row.rental_id),
+      status: row.status as RentalVerificationStatus,
+      operatorChatId: row.operator_chat_id ? String(row.operator_chat_id) : null,
+      ownerChatId: row.owner_chat_id ? String(row.owner_chat_id) : null,
+      bikeName: String(snap.bikeName || "аренда"),
+      amountRub: Number.isFinite(total) && total > 0 ? total : 0,
+      crewSlug: row.crew_slug ? String(row.crew_slug) : null,
+    };
+  };
+  try {
+    const baseSelect =
+      "rental_id, status, operator_chat_id, owner_chat_id, crew_slug, requested_at, snapshot";
+    const openStatuses = ["pending", "operator_confirmed", "owner_confirmed"] as const;
+    // 1) Personal queue — rows where the viewer is a party.
+    {
+      let q = supabaseAdmin
+        .from("rental_verifications")
+        .select(baseSelect)
+        .in("status", [...openStatuses])
+        .or(`operator_chat_id.eq.${viewer},owner_chat_id.eq.${viewer}`)
+        .order("requested_at", { ascending: false })
+        .limit(1);
+      if (exclude) q = q.neq("rental_id", exclude);
+      const { data, error } = await q;
+      if (!error) {
+        const hit = pick(data);
+        if (hit) return hit;
+      } else if (isMissingRelationError(error)) {
+        return null;
+      } else {
+        logger.warn("[rental-verify] next-pointer party query failed:", error.message);
+      }
+    }
+    // 2) Crew-wide fallback for staff (owner sees the crew's queue).
+    if (params.crewSlug) {
+      const staff = await loadCrewStaffChatIds(params.crewSlug);
+      if (staff.includes(viewer)) {
+        const { data: crew } = await supabaseAdmin
+          .from("crews")
+          .select("id")
+          .eq("slug", params.crewSlug)
+          .maybeSingle();
+        if (crew?.id) {
+          let q2 = supabaseAdmin
+            .from("rental_verifications")
+            .select(baseSelect)
+            .in("status", [...openStatuses])
+            .eq("crew_id", crew.id)
+            .order("requested_at", { ascending: false })
+            .limit(1);
+          if (exclude) q2 = q2.neq("rental_id", exclude);
+          const { data: rows2, error: err2 } = await q2;
+          if (!err2) return pick(rows2);
+        }
+      }
+    }
+  } catch (e) {
+    logger.warn("[rental-verify] findNextVerificationFor failed (non-fatal):", e);
+  }
+  return null;
+}
+
+/**
+ * Task 122 — the shared «verified» done-DM (both verify paths funnel here:
+ * the plain ✅✅ and the accepted deal). Base text + the warm half:
+ * ⚡️ speed flex (same 60-min window as verify_speedy), 🏆 explicit ladder to
+ * the next verification achievement, a ✨ warm closer instead of a cold stop,
+ * and the ⏭ NEXT open сверка pointer with a 👀 deeplink («notification can
+ * contain quick "next" latest unverified rental to maybe look at» — boss
+ * 2026-10-21). Every step per-recipient and strictly non-fatal.
+ */
+async function sendVerifiedDoneDms(params: {
+  rentalId: string;
+  crewSlug: string | null | undefined;
+  requestedAtIso: string | null | undefined;
+  verifiedAtIso: string | null | undefined;
+  /** Full base text WITHOUT the warm half (may differ per recipient). */
+  baseText: (chatId: string) => string;
+  recipients: string[];
+}): Promise<void> {
+  const speedLine = verificationSpeedLine(params.requestedAtIso, params.verifiedAtIso);
+  const warm = warmCloserLine(params.rentalId);
+  let botUsername: string | null = null;
+  try {
+    const { resolveCrewBotUsername } = await import("@/app/franchize/lib/crew-bot");
+    botUsername = await resolveCrewBotUsername(params.crewSlug || null);
+  } catch {
+    botUsername = null;
+  }
+  const { buildTelegramAppLink } = await import("@/lib/wall-deeplink");
+  for (const chatId of params.recipients) {
+    try {
+      const parts: string[] = [params.baseText(chatId)];
+      if (speedLine) parts.push(`\n\n${speedLine}`);
+      const progress = verifyProgressLine(await countVerifiedFor(chatId).catch(() => 0));
+      if (progress) parts.push(`\n${progress}`);
+      // Task 124 — the 🕶️ no-problemo streak rides with the celebration
+      // (quiet below 3; at 13 the «13 no problemo подряд» badge lands too).
+      const streakLine = streakProgressLine(await loadNoProblemoStreakFor(chatId).catch(() => 0));
+      if (streakLine) parts.push(`\n${streakLine}`);
+      parts.push(`\n✨ ${warm}`);
+      const next = await findNextVerificationFor({
+        chatId,
+        crewSlug: params.crewSlug || null,
+        excludeRentalId: params.rentalId,
+      }).catch(() => null);
+      const keyboard: Array<Array<{ text: string; callback_data?: string; url?: string }>> = [];
+      if (next) {
+        parts.push(
+          `\n\n${nextUpLine({
+            bikeName: next.bikeName,
+            amountRub: next.amountRub,
+            status: next.status,
+            viewerIsOperator: !!next.operatorChatId && next.operatorChatId === chatId,
+            viewerIsOwner: !!next.ownerChatId && next.ownerChatId === chatId,
+          })}`,
+        );
+        if (botUsername) {
+          // Review #3: a cross-crew pointer must deeplink through THAT crew's
+          // bot (startapp=rental_… resolves per-crew bot), falling back to the
+          // current bot when the pointer's crew has no bot of its own.
+          let linkBot = botUsername;
+          if (next.crewSlug && next.crewSlug !== (params.crewSlug || null)) {
+            try {
+              const { resolveCrewBotUsername } = await import("@/app/franchize/lib/crew-bot");
+              linkBot = (await resolveCrewBotUsername(next.crewSlug)) || botUsername;
+            } catch {
+              linkBot = botUsername;
+            }
+          }
+          const bikeLabel = next.bikeName.length > 24 ? `${next.bikeName.slice(0, 23)}…` : next.bikeName;
+          keyboard.push([
+            {
+              text: `👀 Следующая: ${bikeLabel}`,
+              url: buildTelegramAppLink(linkBot, `rental_${next.rentalId}`),
+            },
+          ]);
+        }
+      }
+      // Task 107: every «verified» DM still carries the payout-hub entry —
+      // the money game continues after the confirm.
+      keyboard.push([{ text: "💰 Мои выплаты", callback_data: "payo_hub_0" }]);
+      await sendComplexMessage(chatId, parts.join(""), keyboard, {
+        parseMode: "HTML",
+        keyboardType: "inline",
+      });
+    } catch {
+      /* non-fatal */
+    }
+  }
+}
+
+/**
  * Bike preview photo before the verification summary (task 117). A separate
  * plain message — sendPhoto captions cap at 1024 chars, and the rich summary
  * needs every byte of the 4096 text budget. Any failure is cosmetic: the
@@ -678,15 +1013,74 @@ async function sendVerificationBikePhoto(
   }
 }
 
+/**
+ * Task 123 — the rental's own «ДО/ПОСЛЕ» state photo, right after the bike
+ * preview (boss: «besides picture of the bike — send photos before/after
+ * presence»). ONE extra message per recipient, deliberately: the «ПОСЛЕ»
+ * shot is the one a сверка actually needs (state at return), «ДО» rides as
+ * the fallback when no return photo exists; both counts still show in the
+ * summary text. Private-bucket paths are signed HERE (send time, 1h TTL) —
+ * frozen paths never go stale. Cosmetic-only — never blocks the summary.
+ */
+async function signedStatePhoto(
+  photos: RentalVerificationSnapshot["photos"],
+): Promise<{ url: string; caption: string } | null> {
+  const attempts: Array<{ url?: string | null; path?: string | null; caption: string }> = [
+    { url: photos?.afterUrl, path: photos?.afterPath, caption: "📸 ПОСЛЕ — состояние при возврате" },
+    { url: photos?.beforeUrl, path: photos?.beforePath, caption: "📸 ДО — состояние при выдаче" },
+  ];
+  for (const a of attempts) {
+    // 1) a public metadata URL (start/end_photo_url) — usable as-is
+    const url = (a.url || "").trim();
+    if (url && /^https:\/\//i.test(url)) return { url, caption: a.caption };
+    // 2) the durable storage path — mint a short-lived signed link
+    const path = (a.path || "").trim();
+    if (path) {
+      try {
+        const { data, error } = await supabaseAdmin.storage
+          .from("rental-photos")
+          .createSignedUrl(path, 3600);
+        const signed = data?.signedUrl;
+        if (!error && signed && /^https?:\/\//i.test(signed)) return { url: signed, caption: a.caption };
+        logger.warn(`[rental-verify] state photo sign failed for ${path}: ${error?.message || "no url"}`);
+      } catch (e) {
+        logger.warn("[rental-verify] state photo sign threw (cosmetic):", e);
+      }
+    }
+  }
+  return null;
+}
+
+async function sendVerificationStatePhoto(
+  chatId: string,
+  photos: RentalVerificationSnapshot["photos"],
+): Promise<void> {
+  const pick = await signedStatePhoto(photos);
+  if (!pick) return;
+  try {
+    const res = await telegramDeliver("sendPhoto", chatId, {
+      photo: pick.url,
+      caption: pick.caption,
+    });
+    if (res?.ok === false) {
+      logger.warn(`[rental-verify] state photo rejected for ${chatId}: ${res.error || "unknown"}`);
+    }
+  } catch (e) {
+    logger.warn(`[rental-verify] state photo send failed for ${chatId} (cosmetic):`, e);
+  }
+}
+
 // ── VF-FIX 2026-10-18: staff cc helper ─────────────────────────────────────
 
 /**
  * Task 118 — chat ids of the CREW STAFF: crew owner + admins/co_owner
  * (active). They act as «admin» in the verification machine (same ✅/⚠️
- * buttons as the parties; ✅ verifies instantly). Deliberately NOT
- * resolveLeadNotifyRecipients — that one also appends the global
- * ADMIN_CHAT_ID, which is a server-level operator, not this crew's supervisor.
- * Never throws — worst case an empty list (then admins simply have no buttons).
+ * buttons as the parties). Task 120 semantics: an admin ✅ stamps the
+ * administration's voice — the FINAL word always stays with the owner party.
+ * Deliberately NOT resolveLeadNotifyRecipients — that one also appends the
+ * global ADMIN_CHAT_ID, which is a server-level operator, not this crew's
+ * supervisor. Never throws — worst case an empty list (then admins simply
+ * have no buttons).
  */
 export async function loadCrewStaffChatIds(crewSlug: string | null | undefined): Promise<string[]> {
   if (!crewSlug) return [];
@@ -723,7 +1117,8 @@ export async function loadCrewStaffChatIds(crewSlug: string | null | undefined):
  * verification parties / actor / attribution chats.
  * Task 118 (boss: «show buttons to admin as well»): the copy now carries the
  * SAME ✅/⚠️ keyboard — staff act as «admin» in the state machine (an admin ✅
- * verifies instantly, ⚠️ opens the dispute editor). Never throws.
+ * stamps the administration's voice, the owner party's ✅ stays mandatory-
+ * final per task 120; ⚠️ opens the dispute editor). Never throws.
  */
 export async function ccVerificationToCrewStaff(params: {
   crewSlug: string | null;
@@ -731,6 +1126,8 @@ export async function ccVerificationToCrewStaff(params: {
   summary: string;
   /** Task 117: bike photo preview sent right before the copy (cosmetic). */
   bikePhotoUrl?: string | null;
+  /** Task 123: the rental's own ДО/ПОСЛЕ state shot for the staff copy. */
+  statePhotos?: RentalVerificationSnapshot["photos"];
   exclude: Array<string | null | undefined>;
   /** Task 118: the ✅/⚠️ keyboard for staff (they are first-class actors now). */
   keyboard?: InlineButton[][];
@@ -789,6 +1186,8 @@ export async function ccVerificationToCrewStaff(params: {
         // Task 117: the same bike preview the parties got (cosmetic — never
         // counted as a delivery, never blocks the text copy).
         await sendVerificationBikePhoto(chatId, params.bikePhotoUrl, "");
+        // Task 123: the ДО/ПОСЛЕ state shot rides along for staff too.
+        await sendVerificationStatePhoto(chatId, params.statePhotos);
       } catch {
         /* cosmetic only */
       }
@@ -973,7 +1372,9 @@ export async function handleRentalVerifyCallback(params: {
     // row — the state machine is idempotent, so the loser converges to
     // «verified» instead of clobbering it.
     // Task 118: crew staff (owner/admin/co_owner of the CREW) act as «admin» —
-    // an admin ✅ verifies instantly, an admin ⚠️ disputes + opens the editor.
+    // an admin ✅ stamps the administration's voice (final only when the owner
+    // party has already confirmed — task 120), an admin ⚠️ disputes + opens
+    // the editor.
     let current_ = current;
     const staffChatIds = await loadCrewStaffChatIds(current_.crew_slug || null);
     let result = applyVerificationAction(current_, {
@@ -1101,31 +1502,35 @@ export async function handleRentalVerifyCallback(params: {
         freshScore && current_.operator_chat_id
           ? `\n\n🏅 Счёт ${escapeVerifyHtml(labelFromUsersMap(usersMap, current_.operator_chat_id))}: <b>${formatRubVerify(freshScore.sum)}</b> (${freshScore.count} ар.) — +${formatRubVerify(confirmedAmount)} за эту аренду 💰`
           : "";
-      const doneFinal =
-        (agreedNego.agreed
-          ? formatDealDoneText({
-              snapshot: snapshot || {},
-              agreedSplit: agreedNego.agreed.split,
-              proposerLabel: labelFromUsersMap(usersMap, agreedNego.agreed.proposedBy),
-              acceptorLabel: labelFromUsersMap(usersMap, agreedNego.agreed.acceptedBy),
-            })
-          : doneText) + scoreTail;
-      // Task 107: every «verified» DM now carries the payout-hub entry —
-      // the money game continues after the confirm (see the payout counter).
-      const payoutDoneKb = [[{ text: "💰 Мои выплаты", callback_data: "payo_hub_0" }]];
+      const baseDone = agreedNego.agreed
+        ? formatDealDoneText({
+            snapshot: snapshot || {},
+            agreedSplit: agreedNego.agreed.split,
+            proposerLabel: labelFromUsersMap(usersMap, agreedNego.agreed.proposedBy),
+            acceptorLabel: labelFromUsersMap(usersMap, agreedNego.agreed.acceptedBy),
+          })
+        : doneText;
+      // Task 122: the warm half (speed / ladder / closer / next-up) is shared
+      // with the deal-accept path — one funnel, same game feel everywhere.
+      const staffNoteText = baseDone + scoreTail;
       const verifiedRecipients = [...new Set([current.operator_chat_id, current.owner_chat_id].filter(Boolean) as string[])];
-      for (const chatId of verifiedRecipients) {
-        try {
-          await sendComplexMessage(chatId, doneFinal, payoutDoneKb, { parseMode: "HTML", keyboardType: "inline" });
-        } catch {
-          /* non-fatal */
-        }
-      }
+      await sendVerifiedDoneDms({
+        rentalId,
+        crewSlug: current.crew_slug || null,
+        requestedAtIso: current_.requested_at,
+        verifiedAtIso: current_.verified_at,
+        baseText: () =>
+          // Review #2: restore the pre-122 behavior — BOTH parties (and the
+          // staff note) see the operator's 🏅 score tail, same as the old
+          // doneFinal. The scoreTail is "" when there is no operator party.
+          baseDone + scoreTail,
+        recipients: verifiedRecipients,
+      });
       // Task 118: staff (who were not parties) see the outcome too — plain note.
       await ccVerificationNoteToCrewStaff({
         crewSlug: current.crew_slug || null,
         rentalId,
-        text: doneFinal,
+        text: staffNoteText,
         exclude: [...verifiedRecipients, isAdminVerify ? String(params.chatId) : ""],
       });
       await grantVerificationAchievements(current_, { speedy: isSpeedyConfirm(current_) });
@@ -1633,17 +2038,24 @@ export async function handleRentalVerifyProposalCallback(params: {
             proposerLabel: labelFromUsersMap(usersMap, proposerChatId),
             acceptorLabel: actorLabel,
           });
+          // Task 122: the deal path funnels through the SAME gamified done-DM
+          // (speed / ladder / closer / next-up) + the operator piggy bank
+          // grows here too — the deal IS a verified сверка.
+          const dealScore = await loadOperatorVerifiedScore(current.operator_chat_id).catch(() => null);
+          const { amount: dealAmount } = commissionOf({ snapshot: current.snapshot, negotiation: acc.state });
+          const dealScoreTail =
+            dealScore && current.operator_chat_id
+              ? `\n\n🏅 Счёт ${escapeVerifyHtml(labelFromUsersMap(usersMap, current.operator_chat_id))}: <b>${formatRubVerify(dealScore.sum)}</b> (${dealScore.count} ар.) — +${formatRubVerify(dealAmount)} за эту аренду 💰`
+              : "";
           const doneRecipients = [...new Set([current.operator_chat_id, current.owner_chat_id].filter(Boolean) as string[])];
-          for (const c of doneRecipients) {
-            try {
-              await sendComplexMessage(c, done, [[{ text: "💰 Мои выплаты", callback_data: "payo_hub_0" }]], {
-                parseMode: "HTML",
-                keyboardType: "inline",
-              });
-            } catch {
-              /* non-fatal */
-            }
-          }
+          await sendVerifiedDoneDms({
+            rentalId,
+            crewSlug: current.crew_slug || null,
+            requestedAtIso: current.requested_at,
+            verifiedAtIso: confirmRow.verified_at,
+            baseText: () => done + dealScoreTail,
+            recipients: doneRecipients,
+          });
           // Task 118: staff see the closed deal too (an admin acceptor gets no
           // DM — he pressed the button — so the note is his visibility).
           await ccVerificationNoteToCrewStaff({
@@ -1952,11 +2364,36 @@ function isSpeedyConfirm(row: RentalVerificationRow): boolean {
 // ── Achievements (gamified reconciliation) ───────────────────────────────────
 
 /**
+ * Task 124 — the party's current no-problemo streak: verified rows,
+ * newest-first (by verified_at; a verified row always has it set), walked
+ * while the frozen snapshot says no_problemo. Old pre-task123 rows without
+ * the reasonability block break the streak (unknown ≠ clean). Non-fatal.
+ */
+export async function loadNoProblemoStreakFor(chatId: string | null | undefined): Promise<number> {
+  const viewer = chatId ? String(chatId) : "";
+  if (!viewer) return 0;
+  try {
+    const { data, error } = await supabaseAdmin
+      .from("rental_verifications")
+      .select("snapshot")
+      .eq("status", "verified")
+      .or(`operator_chat_id.eq.${viewer},owner_chat_id.eq.${viewer}`)
+      .order("verified_at", { ascending: false, nullsFirst: false })
+      .limit(100);
+    if (error) return 0;
+    return computeNoProblemoStreak((data || []) as StreakRow[]);
+  } catch {
+    return 0;
+  }
+}
+
+/**
  * Fired when a rental reaches «verified». Both confirming humans get credit:
  *   • rentalsVerified counter — ABSOLUTE SET from the DB (the shift.ts
  *     «731 смены» lesson: derived values are never incremented from stale
  *     totals);
- *   • verify_first / verify_10 / verify_50 thresholds;
+ *   • verify_first / verify_10 / verify_50 / verify_100 thresholds;
+ *   • verify_streak_13 — 13 «no problemo» сверки in a row (task 124);
  *   • verify_speedy — both sides agreed within one hour of the request.
  */
 export async function grantVerificationAchievements(
@@ -1990,6 +2427,11 @@ export async function grantVerificationAchievements(
       if (verifiedCount >= 1) grants.push({ id: "verify_first", context: { verifiedCount } });
       if (verifiedCount >= 10) grants.push({ id: "verify_10", context: { verifiedCount } });
       if (verifiedCount >= 50) grants.push({ id: "verify_50", context: { verifiedCount } });
+      // Task 123 (boss: «verify_100 tier») — the ladder continues.
+      if (verifiedCount >= 100) grants.push({ id: "verify_100", context: { verifiedCount } });
+      // Task 124 (boss: «crank it to 13») — the no-problemo streak badge.
+      const streak = await loadNoProblemoStreakFor(chatId);
+      if (streak >= 13) grants.push({ id: "verify_streak_13", context: { streak } });
       if (opts.speedy) {
         grants.push({
           id: "verify_speedy",
