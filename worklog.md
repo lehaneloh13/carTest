@@ -10,6 +10,24 @@
 > не уничтожал журнал.
 
 ---
+Task ID: 11
+Agent: main (Super Z, IM session)
+Task: fix docs/crewDocs/october-deposit-backfill-2026-10-22.sql (Paul: «ERROR 42804: COALESCE types text and integer cannot be matched» at line 37) + check/enhance the salavey13 page from the parallel agent (boss: «vip-bike crew is kinda test-first-real client… stats for season… counting one operator's commissions… sell app installations to others — some crews are preprepared»).
+
+Work Log:
+- 42804 root cause (types read from migrations, not guessed): private.rental_contract_artifacts.deposit_rub — TEXT (DDL 20260612000000), holds contract-printed strings («20 000», «20 000 ₽», legacy «не указан»); the app parses it with [^\d] strip in deposit-rail.ts:88 / actions-runtime.ts:3325. public.rentals.deposit_amount — numeric (20260726000001), so only the artifact side crashed; the UPDATE had the same latent crash (text → numeric assignment).
+- Fix: CREATE FUNCTION private.money_to_num(text) — digits-only strip → '' → NULL → 0 (COALESCE(NULLIF(regexp_replace(t,'[^0-9]','','g'),'')::numeric,0)); IMMUTABLE; can never throw on any paper string. Guard = money_to_num(a.deposit_rub) > 0; UPDATE SET deposit_amount = c.paper_deposit_num. Dry-run now shows raw paper string AND parsed number side-by-side for Paul's eyeball check. Header documents the WHY + cleanup DROP FUNCTION note. Sanity-matrix tested in Python (20000 / «20 000 ₽» / «не указан» / NULL / «5 000 р.» → ok). First draft used [^0-9.,]+comma→dot — caught my own bug (COALESCE fallback ''::numeric would throw) and kopeck-inflation risk before it shipped; digits-only == app behavior.
+- salavey13 page found: app/sly13/page.tsx from parallel agent's commit 46fc64a5 (2026-10-19, same wave as pavele0903 + sly13 hydration SQL) — placeholder cards «Операционный блок из metadata seed», and live /sly13 → 404 because prod build lags main (confirmed earlier in task 114).
+- Rebuilt the landing from repo analytics: hero («первый клиент боевой, не синтетика» → VIP BIKE link), season-2026 KPI from worklog 111/113 E2E (308 аренд, ≈2,0 млн ₽ аренда, 31 ДКП ≈13,0 млн ₽, касса ≈16,5 млн ₽), CSS month bars Май10→Сен109(+Окт31) + 145-документов архив/retro +188k, сверка section (October sus-разбор: 154/32/18 — депозиты восстановлены бэкфиллом выше), франшиза-экономика section (пайплайн экипажей moto-selection/georg-electro/nn-mototeh-nn/djorudjov + white-label 1–2 недели + XTR + FRZ-R12 каркас), услуги grid из реального sly13-seed.sql (Запуск «Базовый» 25 000 ₽ / «Под ключ» 60 000 ₽ / vibe-сессии 5 000/7 000 / обучение 3 000 / сопровождение 15 000), CTA @SALAVEY13 + каталог/contacts links. SEO metadata added.
+- Fixed two latent page bugs found en route: (1) palette.accentTextOn does not exist on FranchizeTheme palette (7 keys only) — TS swallowed by ignoreBuildErrors; (2) supabaseAdmin THROWS synchronously when Supabase is misconfigured (lib/supabase-server.ts proxy) and getCrewPaletteBySlug has no try/catch → the landing 500s into the shell (reproduced in dev without env). Page now falls back to the sly13 palette from sly13-franchize-hydration.sql («Cyan on Graphite» #0F1419/#06B6D4) — DB hiccup can't take the landing down.
+- Checks: tsc --noEmit → 0 errors in app/sly13/page.tsx (17 pre-existing transitive debt files, unchanged); typecheck:franchize slice passed; next lint --file app/sly13/page.tsx → clean; dev E2E: /sly13 200, full body render (6 174 Cyrillic chars, all 17 content probes OK, fallback palette applied).
+
+Stage Summary:
+- SQL: october-deposit-backfill-2026-10-22.sql готов к запуску Paul'ом как есть (function → dry-run → apply → verify → optional cleanup), 42804 устранён и задокументирован.
+- Landing: /sly13 теперь рассказывает историю продукта доказательствами из репо — боевой vip-bike сезон, сверка/комиссии, пайплайн франшиз, продуктовые пакеты запуска; палитра из гидрации, отказоустойчивость к БД.
+- Напоминание из task 114 остаётся в силе: prod отстаёт от main — перевыпуск production deployment подхватит и лендинг, и свежие wheel/mapriders fast-path фиксы.
+
+---
 Task ID: 10
 Agent: main (Super Z)
 Task: «В корзине поле под промокод, при введении в которое промокод "promoride" цена на выбранный товар будет меняться на 0. Проверь себя и оцени свою работу, повтори максимум 4 раза, пока не оценишь на 8.»
@@ -1083,3 +1101,23 @@ Work Log:
 Stage Summary:
 - startapp=wheel → vip-bike (да, дефолт); startapp=wheel_nn-mototeh-nn И startapp=nn-mototeh-nn_wheel → /franchize/nn-mototeh-nn/wheel. Link format for posts: https://t.me/oneBikePlsBot/app?startapp=<any of the three forms>.
 - Не забыть: prod rental.vip-bike.ru всё ещё отстаёт от main (task 114 note) — redeploy production, чтобы suffix-форма и остальные фиксы доехали.
+
+---
+Task ID: 110-heic-upload-support
+Agent: main (Claude)
+Task: HEIC/HEIF upload support — convert to JPEG on the fly in all client-compressed image upload surfaces (rental before/after photos, doc OCR, wall, storage, meetups, car form).
+
+Work Log:
+- Root cause: lib/client-image-compress.ts decoded via <img> — HEIC decodes natively only in Safari; Chrome/Android/Firefox/Windows hard-failed with "Failed to load image". PhotoUploadButton also carried a stale local copy of the compressor.
+- lib/client-image-compress.ts: added layered HEIC detection (ISO-BMFF ftyp magic brands heic/heix/hevc/.../mif1/msf1 → MIME image/heic|heif → extension .heic/.heif/.hif) + convertHeicToJpeg() via lazy import("heic2any") (libheif wasm chunk fetched only on fallback path; Safari never downloads it). Contract: reduceImageResolution() always resolves to JPEG — original HEIC never returned (CR "bigger-file" fix gated on !heicConverted).
+- PhotoUploadButton.tsx: local reduceImageResolution removed → shared lib (1920/q0.85 kept); validation accepts empty-MIME HEIC by extension; guard 10→25 MB.
+- app/rentals/[id]/page.tsx PhotoUploader: now compresses (1400/q0.70) + converts before uploadSingleImage — was raw upload (undisplayable .heic in public rentals bucket, no resize).
+- accept="image/*,.heic,.heif" (or +image/heif) on 8 inputs: rental gallery, rental page, doc OCR, wall composer, storage story ×2, storage wall, meetup modal, car form. Meetup modal validation relaxed for empty MIME.
+- npm dep: heic2any 0.0.4 (types bundled). Server routes untouched — clients now always send JPEG.
+- Tests: new tests/lib/heic-upload-support.spec.ts (magic-byte unit tests via jsdom File + wiring assertions); 7 spec files green — 188 passed.
+- Checks: typecheck:franchize slice PASS; targeted tsc on changed files → zero errors in changed files (only pre-existing debt: CarSubmissionForm:204 'id' confirmed on base via stash); eslint --max-warnings=0 clean on all changed files.
+- Committed + pushed: eeda2e6 (repo moved to salavey13/carTest, push OK after rebase).
+
+Stage Summary:
+- HEIC (iPhone default) photos now upload successfully from every browser across all compressed upload surfaces; payload becomes .jpg + image/jpeg before hitting server pipelines.
+- Known limits: heic2any converts only still images (no HEIC bursts/multi-image in first pass — takes first frame); corrupt HEIC surfaces a clear RU toast advising screenshot/JPG.
