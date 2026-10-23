@@ -15,13 +15,49 @@
 // operator salary (ЗП аренды + ЗП продажи; gear & service pay no bonus).
 // Legacy flat sheets (sales variant, old exports) fall back to the original
 // single-grid rendering.
+//
+// Task 127 (2026-10-23, boss):
+//   1. Verification row tints are now THEME-PROOF: they mix the tone color
+//      into the theme's own card bg (color-mix) — light theme keeps its pastel
+//      rows, dark theme gets a DARK tint so white body text stays readable
+//      (the old hardcoded pastels washed out white text in dark).
+//   2. The whole modal panel clears the Telegram fullscreen native buttons
+//      (useTelegramContentSafeTop) — the header «x» no longer hides under
+//      them; closing always reachable.
+//   3. When ≥2 operators carry ЗП this period, a «ЗП по операторам» strip
+//      splits the commissions (who has how much of the total + %), and table
+//      rows get the operator's stable emoji marker (date cell + op cell).
+//
+// Task 128 (2026-10-23, boss):
+//   1. Tap a split pill → the table filters to that operator's rows
+//      (АРЕНДЫ + ПРОДАЖИ blocks; tap again / «показать всех» → back). The
+//      split itself reads the PRE-filter sections, so the pills stay
+//      tappable — you can hop between operators without unfiltering.
+//   2. Quick verify right in the table: owner-tier viewers get a ✓ on every
+//      unverified АРЕНДЫ row — confirm → adminVerifyRentalAction (the same
+//      server action as the rental-page card) → optimistic «подтверждено»
+//      tint + a silent CSV refetch for the canonical label. The October
+//      never-verified sweep is now «filter ➕ без сверки → ✓ ✓ ✓».
 
 import { useCallback, useEffect, useState } from "react";
 import { createPortal } from "react-dom";
 import { useRouter } from "next/navigation";
-import { X, Download, Loader2, Send, Search, Table2, Camera } from "lucide-react";
+import { X, Download, Loader2, Send, Search, Table2, Camera, Check } from "lucide-react";
+import { toast } from "sonner";
+// Task 128 — same owner-gated action the rental-page verification card uses.
+import { adminVerifyRentalAction } from "@/app/franchize/server-actions/rental-verify-actions";
 import type { ThemeTokens } from "../hooks/useTheme";
 import { toNumber } from "./lib/csv-money";
+// Task 127 — fullscreen TG native buttons (close/expand) overlay the top-right
+// corner; without this the header «x» sits right under them.
+import { useTelegramContentSafeTop } from "@/app/franchize/hooks/useTelegramContentSafeTop";
+// Task 127 — per-operator commission split + stable emoji identities.
+import {
+  buildOperatorSplit,
+  operatorIconOf,
+  operatorColorOf,
+  type OperatorSplitEntry,
+} from "./lib/operator-split";
 import {
   parseCsvSections,
   pluralBlocksRu,
@@ -44,6 +80,14 @@ interface ExportCsvModalProps {
   variant?: "rentals" | "sales";
   /** Crew slug — powers the rental-row tap-through (АРЕНДЫ block). */
   slug?: string;
+  /** Task 127 — dark theme ⇒ brighter verification tone text. Optional: when
+   *  the caller can't know (CSS-var themes) the light tones are kept — the
+   *  row tints stay theme-proof either way (they derive from the theme bg). */
+  isDark?: boolean;
+  /** Task 128 — viewer passed the owner-tier gate (owner/admin/co_owner):
+   *  unverified АРЕНДЫ rows get an inline ✓ quick-verify button. The server
+   *  action re-gates, this only decides whether the button renders. */
+  canVerify?: boolean;
 }
 
 function firstDayOfMonthIso(): string {
@@ -141,12 +185,16 @@ const SALES_NUMERIC_COLS = new Set([3]);
 const SALES_DATE_COLS = new Set([0]);
 
 // ── Block-section column kinds (iter52) ─────────────────────────────────────
-// Column indexes per block of the new sheet layout:
-//   АРЕНДЫ  (15): Дата, ЗП, Партнеру, Цена, Экип, Залог, Марка, Одо, Одо,
-//                 Время, Комментарий, Заметки, Субарендатор, Фото, ID
+// Column indexes per block of the new sheet layout (builder: rentals-csv.ts):
+//   АРЕНДЫ  (25): Дата, ЗП Аренда, Партнеру, Цена, Экип, Залог, Марка,
+//                 Пробег до, Пробег после, Время, Комментарий, Заметки,
+//                 Субарендатор, Фото, ID, ЗП техника, ЗП экип, ЗП наценка,
+//                 Экип флаги, Оператор создал, Оператор выдал, Оператор
+//                 принял, Оператор (ЗП), Атрибуция ЗП, Верификация
 //   ЭКИП     (7): Дата, Наименование, Цена, Выдал, Принял, Комментарий, ID
 //   СЕРВИС   (5): Дата, Услуга, Байк, Цена, ID
-//   ПРОДАЖИ  (6): Дата, ЗП Продажа, Наименование, Цена, Комментарий, ID
+//   ПРОДАЖИ  (8): Дата, ЗП Продажа, Наименование, Цена, Комментарий, ID,
+//                 Оператор (ЗП), Атрибуция ЗП
 //   СВОДКА   (5): Блок, Записей, Выручка, ЗП, Примечание
 interface SectionColCfg {
   numeric: Set<number>;
@@ -157,6 +205,9 @@ interface SectionColCfg {
   photos?: number;
   /** Task 124 — «Верификация» column (АРЕНДЫ only): colored + tints the row. */
   verification?: number;
+  /** Task 127 — «Оператор (ЗП)» column: powers the commission split + row
+   *  emoji markers (АРЕНДЫ col 22, ПРОДАЖИ col 6 in the new sheet layout). */
+  opCol?: number;
   /** Rental uuid column for the row tap-through (АРЕНДЫ only). */
   idCol: number;
 }
@@ -170,11 +221,12 @@ const SECTION_COLS: Record<CsvSectionKey, SectionColCfg> = {
     subrenter: 12,
     photos: 13,
     verification: 24,
+    opCol: 22,
     idCol: 14,
   },
   equipment: { numeric: new Set([2]), date: new Set([0]), hide: new Set([6]), idCol: -1 },
   service: { numeric: new Set([3]), date: new Set([0]), hide: new Set([4]), idCol: -1 },
-  sales: { numeric: new Set([1, 3]), date: new Set([0]), hide: new Set([5]), idCol: -1 },
+  sales: { numeric: new Set([1, 3]), date: new Set([0]), hide: new Set([5]), opCol: 6, idCol: -1 },
   summary: { numeric: new Set([1, 2, 3]), date: new Set(), hide: new Set(), idCol: -1 },
 };
 
@@ -206,16 +258,33 @@ function verificationToneOf(label: string): VerTone {
   if (s.includes("ждёт") || s.includes("ожидает")) return "waiting";
   return null;
 }
-const VER_TONE_BG: Record<Exclude<VerTone, null>, string> = {
-  verified: "#e7f6ec",
-  disputed: "#fde9e9",
-  waiting: "#fdf3e0",
-};
 const VER_TONE_FG: Record<Exclude<VerTone, null>, string> = {
   verified: "#16a34a",
   disputed: "#dc2626",
   waiting: "#d97706",
 };
+// Task 127 — dark theme reads better with brighter tone text (the light-theme
+// greens/reds are tuned for pastel-on-white and go muted on dark tints).
+const VER_TONE_FG_DARK: Record<Exclude<VerTone, null>, string> = {
+  verified: "#4ade80",
+  disputed: "#f87171",
+  waiting: "#fbbf24",
+};
+
+// Task 127 — THEME-PROOF row tints. The old hardcoded pastel hexes sit
+// on white and washed out in the dark theme: pastel bg + white body text ≈
+// white-on-white. Now the tint MIXES the tone color into the theme's own base:
+//   light (white card)  → the same familiar pastels as before (~13% over white);
+//   dark (near-black)   → a DARK tint — white body text stays readable.
+const VER_TONE_TINT_PCT: Record<Exclude<VerTone, null>, number> = {
+  verified: 14,
+  disputed: 13,
+  waiting: 12,
+};
+const verToneBg = (tone: Exclude<VerTone, null>, base: string): string =>
+  `color-mix(in srgb, ${VER_TONE_FG[tone]} ${VER_TONE_TINT_PCT[tone]}%, ${base})`;
+const verToneFg = (tone: Exclude<VerTone, null>, isDark?: boolean): string =>
+  isDark ? VER_TONE_FG_DARK[tone] : VER_TONE_FG[tone];
 
 export function ExportCsvModal({
   isOpen,
@@ -226,8 +295,15 @@ export function ExportCsvModal({
   T,
   variant = "rentals",
   slug,
+  isDark,
+  canVerify = false,
 }: ExportCsvModalProps) {
   const router = useRouter();
+  // Task 127 — px of the TG fullscreen native-buttons zone (exact measurement
+  // on Bot API 8.0+, the app-wide 54px comfort floor on mobile otherwise,
+  // 0 outside Telegram / on wide viewports). Pushes the header — and its
+  // top-right «x» — below the overlapped corner.
+  const tgSafeTop = useTelegramContentSafeTop();
   const [from, setFrom] = useState(firstDayOfMonthIso());
   const [to, setTo] = useState(todayIso());
   const [rows, setRows] = useState<string[][]>([]);
@@ -240,11 +316,26 @@ export function ExportCsvModal({
   // (АРЕНДЫ блок). Chips double as the legend for the row tints. «none» =
   // пустая ячейка — аренды, по которым сверка ещё не заводилась.
   const [verFilter, setVerFilter] = useState<VerFilterKey>("all");
+  // Task 128 — tap a split pill → filter the table to that operator's ЗП
+  // rows (АРЕНДЫ + ПРОДАЖИ). null = no filter (all operators).
+  const [opFilter, setOpFilter] = useState<string | null>(null);
+  // Task 128 — quick-verify bookkeeping: ids with an in-flight action (the ✓
+  // shows a spinner) and ids verified THIS session (optimistic «подтверждено»
+  // tint until the silent CSV refetch brings the canonical label).
+  const [verifyingIds, setVerifyingIds] = useState<Set<string>>(() => new Set());
+  const [justVerified, setJustVerified] = useState<Set<string>>(() => new Set());
 
-  const loadTable = useCallback(async () => {
+  const loadTable = useCallback(async (opts?: { silent?: boolean }) => {
     if (!fetchCsvText || !from || !to || from > to) return;
-    setLoading(true);
-    setError(null);
+    // Task 128 — silent mode: a quick-verify just landed server-side; swap in
+    // the regenerated CSV WITHOUT the loading flash (rows stay on screen).
+    // A silent failure keeps the old rows — the optimistic tint may linger,
+    // but the verify itself DID succeed (the action returned success).
+    const silent = opts?.silent === true;
+    if (!silent) {
+      setLoading(true);
+      setError(null);
+    }
     try {
       const text = await fetchCsvText(from, to);
       setRows(parseCsv(text));
@@ -252,12 +343,53 @@ export function ExportCsvModal({
       // FIX (iter6): show the ACTUAL error next to the generic message so the
       // operator can tell a 500 from an offline device from a bad date range.
       const detail = e instanceof Error ? e.message : String(e);
-      setError(`Не удалось загрузить данные — ${detail}`);
-      setRows([]);
+      if (silent) {
+        console.warn("[ExportCsvModal] silent refetch failed:", detail);
+      } else {
+        setError(`Не удалось загрузить данные — ${detail}`);
+        setRows([]);
+      }
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
   }, [fetchCsvText, from, to]);
+
+  // Task 128 — quick verify from the table view. Same action, same confirm
+  // pattern and same toasts as the rental-page CommissionVerificationCard —
+  // only the entry point is different (a ✓ inside the «Верификация» cell).
+  const handleQuickVerify = useCallback(
+    async (rentalId: string) => {
+      if (!slug || verifyingIds.has(rentalId)) return;
+      const ok = window.confirm(
+        "Подтвердить сверку по этой аренде?\n\nСтрока будет помечена «подтверждено» для оператора и владельца (используйте после личной сверки).",
+      );
+      if (!ok) return;
+      setVerifyingIds((prev) => new Set(prev).add(rentalId));
+      try {
+        const res = await adminVerifyRentalAction({ slug, rentalId });
+        if (res.success) {
+          toast.success("Сверка подтверждена ✅");
+          setJustVerified((prev) => new Set(prev).add(rentalId));
+          void loadTable({ silent: true });
+        } else {
+          toast.error(res.error || "Не удалось подтвердить сверку");
+        }
+      } catch {
+        toast.error("Не удалось подтвердить сверку");
+      } finally {
+        setVerifyingIds((prev) => {
+          const next = new Set(prev);
+          next.delete(rentalId);
+          return next;
+        });
+      }
+    },
+    [slug, verifyingIds, loadTable],
+  );
+  // Owner-tier + rentals variant + a slug to act through — otherwise the ✓
+  // never renders (sales sheets, password viewers, non-owner crew). The
+  // server action re-gates anyway — this is presentation only.
+  const canQuickVerify = canVerify && variant === "rentals" && !!slug;
 
   useEffect(() => {
     if (isOpen) {
@@ -269,6 +401,9 @@ export function ExportCsvModal({
       setSending(false);
       setQuery("");
       setVerFilter("all");
+      setOpFilter(null);
+      setVerifyingIds(new Set());
+      setJustVerified(new Set());
     }
   }, [isOpen]);
 
@@ -365,16 +500,63 @@ export function ExportCsvModal({
       totals: null,
     };
   };
-  // Empty blocks (no data this period) are hidden entirely — the СВОДКА
-  // block still reports their zero totals.
-  const visibleSections = isSectioned
-    ? parsedSections.sections.map(applyFilter).map(applyVerFilter).filter((s) => s.data.length > 0)
-    : [];
 
-  // Totals-card sums per block (client-side over the loaded rows — mirrors
-  // the server-side СВОДКА block, which stays in the file for Excel users).
+  // Task 128 — sumCell lives BEFORE the split block: the pill strip needs the
+  // PRE-op-filter sums before visibleSections exists.
   const sumCell = (section: ParsedCsvSection | undefined, col: number): number =>
     !section || col < 0 ? 0 : section.data.reduce((acc, r) => acc + toNumber(r[col] || ""), 0);
+
+  // Task 128 — the split reads the PRE-op-filter sections (text + ver filters
+  // applied, operator filter NOT): pills stay tappable while a filter is on —
+  // you can hop between operators without unfiltering first. With no operator
+  // filter this is byte-for-byte the old behaviour (preOp === visible).
+  const preOpSections = isSectioned
+    ? parsedSections.sections.map(applyFilter).map(applyVerFilter)
+    : [];
+  const rentPre = preOpSections.find((s) => s.key === "rentals");
+  const salesPre = preOpSections.find((s) => s.key === "sales");
+  const opGrandTotal = sumCell(rentPre, 1) + sumCell(salesPre, 1);
+
+  // Task 127 — per-operator commission split (grouped client-side from the
+  // builder's attribution columns — same chain as the profile math).
+  const opSplit: OperatorSplitEntry[] = (() => {
+    if (!isSectioned) return [];
+    const entries: { label: string; amount: number }[] = [];
+    for (const s of preOpSections) {
+      const cfg = SECTION_COLS[s.key];
+      // Only blocks that both pay and attribute ЗП (АРЕНДЫ, ПРОДАЖИ).
+      if (cfg.opCol == null || s.key === "summary") continue;
+      for (const r of s.data) {
+        const label = (r[cfg.opCol] || "").trim();
+        if (!label) continue;
+        entries.push({ label, amount: toNumber(r[1] || "") });
+      }
+    }
+    return buildOperatorSplit(entries, opGrandTotal);
+  })();
+
+  // Task 128 — tap a split pill → the table filters to that operator's ЗП
+  // rows (АРЕНДЫ + ПРОДАЖИ — the blocks that both pay and attribute). Tap the
+  // active pill again / the «показать всех» chip → back to everyone. The
+  // guard keeps a stale label (date range changed) from blanking the table.
+  const effectiveOpFilter =
+    opFilter && opSplit.some((o) => o.label === opFilter) ? opFilter : null;
+  const applyOpFilter = (s: ParsedCsvSection): ParsedCsvSection => {
+    if (!effectiveOpFilter) return s;
+    const cfg = SECTION_COLS[s.key];
+    // Blocks without operator attribution (ЭКИП / СЕРВИС / СВОДКА) pass through.
+    if (cfg.opCol == null || s.key === "summary") return s;
+    return {
+      ...s,
+      data: s.data.filter((r) => (r[cfg.opCol] || "").trim() === effectiveOpFilter),
+      // Filtered sums would not match the full-period СВОДКА block — hide them.
+      totals: null,
+    };
+  };
+
+  // Empty blocks (no data this period) are hidden entirely — the СВОДКА
+  // block still reports their zero totals.
+  const visibleSections = preOpSections.map(applyOpFilter).filter((s) => s.data.length > 0);
   const secByKey = (key: CsvSectionKey) => visibleSections.find((s) => s.key === key);
   // iter53: value of a named data row inside the СВОДКА block (e.g. «Экип»
   // Выручка). Returns null when the block/row/cell is absent — caller falls
@@ -406,6 +588,16 @@ export function ExportCsvModal({
 
   const formatMoney = (n: number): string =>
     n.toLocaleString("ru-RU", { maximumFractionDigits: 0 });
+
+  // Task 127/128 — split pills render only when the period actually has
+  // SEVERAL operators (pre-op-filter view) — with one operator the plain
+  // «Σ ЗП» tile already tells the whole story.
+  const showOpSplit = opSplit.length >= 2;
+  const opAttributed = opSplit.reduce((acc, o) => acc + o.amount, 0);
+  const opUnattributed = Math.max(0, opGrandTotal - opAttributed);
+  // Row emoji markers ride with the split: with a single operator every row
+  // would wear the same icon — noise instead of information.
+  const showOpMarkers = showOpSplit;
 
   // ── Legacy single-grid values (sales variant / old flat sheets) ───────────
   const headerRow = rows[0] ?? [];
@@ -469,7 +661,13 @@ export function ExportCsvModal({
     >
       <div
         className="flex h-full w-full flex-col sm:h-auto sm:max-h-[88vh] sm:max-w-5xl border shadow-2xl overflow-hidden sm:rounded-2xl"
-        style={{ backgroundColor: T.bgCard, borderColor: T.border }}
+        // Task 127 — the panel starts BELOW the TG fullscreen native buttons:
+        // the header row (and its top-right «x») can no longer hide under them.
+        style={{
+          backgroundColor: T.bgCard,
+          borderColor: T.border,
+          ...(tgSafeTop > 0 ? { paddingTop: `${tgSafeTop}px` } : {}),
+        }}
         onClick={(e) => e.stopPropagation()}
       >
         {/* ── Header — title + close + date pickers + actions ────────────────── */}
@@ -674,6 +872,94 @@ export function ExportCsvModal({
           </div>
         )}
 
+        {/* ── ЗП по операторам (Task 127) — who has how much of the total ──────
+            Rendered only when ≥2 operators carry ЗП this period; with one
+            operator the «Σ ЗП» tile above already tells the whole story.
+            Empty-label rows are surfaced as «без атрибуции» so the pills
+            always reconcile against the tile.
+            Task 128: pills are TOGGLE FILTERS — tap one to show only that
+            operator's rows (АРЕНДЫ + ПРОДАЖИ), tap again or «показать всех»
+            to reset. The strip reads the pre-filter sections, so it stays
+            stable (and switchable) while a filter is on. */}
+        {!loading && !error && showOpSplit && (
+          <div
+            className="border-b px-3 py-2"
+            style={{ borderColor: T.border, backgroundColor: T.bg }}
+            role="group"
+            aria-label="Комиссии по операторам"
+          >
+            <div className="mb-1.5 flex flex-wrap items-baseline gap-x-2">
+              <span
+                className="text-[10px] font-medium uppercase tracking-wide"
+                style={{ color: T.textMuted }}
+              >
+                ЗП по операторам
+              </span>
+              <span className="text-[11px] font-bold tabular-nums" style={{ color: T.text }}>
+                {formatMoney(opGrandTotal)} ₽
+              </span>
+              {opUnattributed > 0.5 && (
+                <span className="text-[10px] tabular-nums" style={{ color: T.textMuted }}>
+                  · без атрибуции {formatMoney(opUnattributed)} ₽
+                </span>
+              )}
+              {effectiveOpFilter && (
+                <span className="text-[10px]" style={{ color: T.textMuted }}>
+                  · таблица показывает только строки выбранного оператора
+                </span>
+              )}
+            </div>
+            <div className="flex flex-wrap gap-1.5">
+              {opSplit.map((op) => {
+                const opActive = effectiveOpFilter === op.label;
+                return (
+                  <button
+                    key={op.label}
+                    type="button"
+                    onClick={() => setOpFilter((cur) => (cur === op.label ? null : op.label))}
+                    aria-pressed={opActive}
+                    className="inline-flex cursor-pointer items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] font-semibold transition hover:opacity-90 focus:outline-none focus-visible:ring-2"
+                    style={{
+                      borderColor: opActive ? op.color : `color-mix(in srgb, ${op.color} 45%, transparent)`,
+                      backgroundColor: `color-mix(in srgb, ${op.color} ${opActive ? 26 : 14}%, ${T.bgCard})`,
+                      color: T.text,
+                      // Task 128 — the active filter pill gets a firm ring:
+                      // discoverable on both themes without shouting.
+                      boxShadow: opActive ? `0 0 0 1.5px color-mix(in srgb, ${op.color} 55%, transparent)` : undefined,
+                    }}
+                    title={
+                      opActive
+                        ? `${op.label} — фильтр активен, нажмите чтобы снова показать всех`
+                        : `${op.label} — ${formatMoney(op.amount)} ₽ из ${formatMoney(opGrandTotal)} ₽ · показать только его строки`
+                    }
+                  >
+                    <span aria-hidden>{op.icon}</span>
+                    <span
+                      className="max-w-[10rem] truncate"
+                      style={{ color: op.color }}
+                    >
+                      {op.label}
+                    </span>
+                    <span className="tabular-nums">{formatMoney(op.amount)} ₽</span>
+                    <span className="tabular-nums opacity-60">{Math.round(op.share * 100)}%</span>
+                  </button>
+                );
+              })}
+              {effectiveOpFilter && (
+                <button
+                  type="button"
+                  onClick={() => setOpFilter(null)}
+                  className="inline-flex min-h-[32px] cursor-pointer items-center gap-1 rounded-full border px-2.5 py-1 text-[11px] font-semibold transition hover:opacity-80 focus:outline-none focus-visible:ring-2"
+                  style={{ borderColor: T.border, backgroundColor: T.bgElevated, color: T.text }}
+                  title="Показать строки всех операторов"
+                >
+                  ✕ показать всех
+                </button>
+              )}
+            </div>
+          </div>
+        )}
+
         {/* ── Сверка filter chips (Task 126) — legend + one-tap «что не сверено» ── */}
         {!loading && !error && isSectioned && (rentalsSectionRaw?.data.length ?? 0) > 0 && (
           <div
@@ -687,9 +973,9 @@ export function ExportCsvModal({
             </span>
             {([
               { key: "all" as const, label: "Все", count: verCounts.all, fg: T.text, bg: "transparent" },
-              { key: "verified" as const, label: "✅ сверены", count: verCounts.verified, fg: VER_TONE_FG.verified, bg: VER_TONE_BG.verified },
-              { key: "waiting" as const, label: "⏳ ждут", count: verCounts.waiting, fg: VER_TONE_FG.waiting, bg: VER_TONE_BG.waiting },
-              { key: "disputed" as const, label: "⚠️ споры", count: verCounts.disputed, fg: VER_TONE_FG.disputed, bg: VER_TONE_BG.disputed },
+              { key: "verified" as const, label: "✅ сверены", count: verCounts.verified, fg: verToneFg("verified", isDark), bg: verToneBg("verified", T.bgElevated) },
+              { key: "waiting" as const, label: "⏳ ждут", count: verCounts.waiting, fg: verToneFg("waiting", isDark), bg: verToneBg("waiting", T.bgElevated) },
+              { key: "disputed" as const, label: "⚠️ споры", count: verCounts.disputed, fg: verToneFg("disputed", isDark), bg: verToneBg("disputed", T.bgElevated) },
               { key: "none" as const, label: "➕ без сверки", count: verCounts.none, fg: T.textMuted, bg: T.bgElevated },
             ]).map((chip) => {
               const active = verFilter === chip.key;
@@ -765,7 +1051,12 @@ export function ExportCsvModal({
                     section={s}
                     T={T}
                     slug={slug}
+                    isDark={isDark}
+                    showOpMarkers={showOpMarkers}
                     onOpenRental={openRentalById}
+                    verifyingIds={verifyingIds}
+                    justVerified={justVerified}
+                    onQuickVerify={canQuickVerify ? handleQuickVerify : undefined}
                   />
                 ))}
               </div>
@@ -994,17 +1285,32 @@ export function ExportCsvModal({
 // ── Block-section table (iter52) ─────────────────────────────────────────────
 // One titled block: colored banner + its own column header + data rows +
 // «Итого …» footer. АРЕНДЫ rows are tap-through (rental uuid in the hidden
-// ID column).
+// ID column). Task 128: unverified АРЕНДЫ rows get an inline ✓ quick-verify
+// button (owner-tier only) — confirm → server action → optimistic tint +
+// silent refetch.
 function SectionTable({
   section,
   T,
   slug,
+  isDark,
+  showOpMarkers = false,
   onOpenRental,
+  verifyingIds,
+  justVerified,
+  onQuickVerify,
 }: {
   section: ParsedCsvSection;
   T: ThemeTokens;
   slug?: string;
+  isDark?: boolean;
+  showOpMarkers?: boolean;
   onOpenRental: (rentalId: string) => void;
+  /** Task 128 — ids with an in-flight verify (the ✓ shows a spinner). */
+  verifyingIds?: Set<string>;
+  /** Task 128 — ids verified this session (optimistic verified tint). */
+  justVerified?: Set<string>;
+  /** Task 128 — present only for owner-tier viewers (rentals variant). */
+  onQuickVerify?: (rentalId: string) => Promise<void> | void;
 }) {
   const cfg = SECTION_COLS[section.key];
   const accent = SECTION_ACCENT[section.key];
@@ -1064,13 +1370,32 @@ function SectionTable({
               section.key === "rentals" && cfg.idCol >= 0 ? (r[cfg.idCol] || "").trim() : "";
             const rowClickable = !!rowRentalId && !!slug;
             const isGrandTotal = isSummary && (r[0] || "").trim().toUpperCase() === "ВСЕГО";
-            // Task 124 — verification tint for the whole АРЕНДЫ row.
+            // Task 124 — verification tint for the whole АРЕНДЫ row (Task 127:
+            // the tint mixes into the THEME bg — dark theme gets a dark tint,
+            // white text stays readable).
+            // Task 128 — a row verified THIS session renders as verified
+            // immediately (optimistic), before the silent refetch lands.
+            const forceVerified = !!(rowRentalId && justVerified?.has(rowRentalId));
             const verTone =
               section.key === "rentals" && cfg.verification != null
-                ? verificationToneOf(r[cfg.verification] || "")
+                ? forceVerified
+                  ? ("verified" as const)
+                  : verificationToneOf(r[cfg.verification] || "")
                 : null;
+            // Task 128 — inline quick-verify: unverified rows with a uuid,
+            // only when the modal was opened by an owner-tier viewer. The
+            // server action re-gates (owner-tier + completed status).
+            const verifyPending = !!(rowRentalId && verifyingIds?.has(rowRentalId));
+            const showQuickVerify =
+              !!onQuickVerify && !!rowRentalId && section.key === "rentals" && verTone !== "verified";
+            // Task 127 — operator identity for this row (when the split is on).
+            const opLabel =
+              showOpMarkers && cfg.opCol != null ? (r[cfg.opCol] || "").trim() : "";
+            const opMeta = opLabel
+              ? { icon: operatorIconOf(opLabel), color: operatorColorOf(opLabel) }
+              : null;
             const rowBg = verTone
-              ? VER_TONE_BG[verTone]
+              ? verToneBg(verTone, T.bgCard)
               : isGrandTotal
                 ? T.bgElevated
                 : isAlt
@@ -1130,8 +1455,10 @@ function SectionTable({
                         ...(ci === cfg.subrenter && cell ? { color: "#f59e0b" } : {}),
                         ...(ci === cfg.photos && cell ? { color: "#22c55e", fontWeight: 600 } : {}),
                         ...(ci === cfg.verification && verTone
-                          ? { color: VER_TONE_FG[verTone], fontWeight: 700 }
+                          ? { color: verToneFg(verTone, isDark), fontWeight: 700 }
                           : {}),
+                        // Task 127 — the operator's label wears their color.
+                        ...(opMeta && ci === cfg.opCol ? { color: opMeta.color, fontWeight: 600 } : {}),
                         ...(ci === 0
                           ? {
                               position: "sticky",
@@ -1143,10 +1470,56 @@ function SectionTable({
                           : {}),
                       }}
                     >
-                      {section.key === "rentals" && ci === cfg.photos && cell ? (
+                      {section.key === "rentals" && ci === cfg.verification && (showQuickVerify || verifyPending || forceVerified) ? (
+                        // Task 128 — «Верификация» cell with the inline ✓.
+                        <span className="inline-flex items-center gap-1.5">
+                          <span
+                            style={{
+                              color: verTone ? verToneFg(verTone, isDark) : undefined,
+                              fontWeight: verTone || forceVerified ? 700 : undefined,
+                            }}
+                          >
+                            {cell || (forceVerified ? "подтверждено" : "\u00A0")}
+                          </span>
+                          {showQuickVerify && (
+                            <button
+                              type="button"
+                              disabled={verifyPending}
+                              onClick={(e) => {
+                                // The row itself is a tap-through to the rental
+                                // page — the ✓ must not trigger it.
+                                e.stopPropagation();
+                                if (onQuickVerify) void onQuickVerify(rowRentalId);
+                              }}
+                              aria-label="Подтвердить сверку"
+                              title="Подтвердить сверку (закрытая аренда; после личной сверки)"
+                              className="inline-flex h-7 w-7 shrink-0 cursor-pointer items-center justify-center rounded-full border transition hover:opacity-85 focus:outline-none focus-visible:ring-2 disabled:cursor-default disabled:opacity-60"
+                              style={{
+                                borderColor: `color-mix(in srgb, ${VER_TONE_FG.verified} 45%, transparent)`,
+                                backgroundColor: `color-mix(in srgb, ${VER_TONE_FG.verified} 12%, ${T.bgCard})`,
+                                color: verToneFg("verified", isDark),
+                              }}
+                            >
+                              {verifyPending ? (
+                                <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden />
+                              ) : (
+                                <Check className="h-3.5 w-3.5" aria-hidden />
+                              )}
+                            </button>
+                          )}
+                        </span>
+                      ) : section.key === "rentals" && ci === cfg.photos && cell ? (
                         <span className="inline-flex items-center gap-1">
                           <Camera className="h-3 w-3" aria-hidden />
                           {cell}
+                        </span>
+                      ) : opMeta && (ci === 0 || ci === cfg.opCol) ? (
+                        // Task 127 — crew-member marker: stable emoji on the
+                        // sticky date cell (always visible while scrolling)
+                        // and next to the name in «Оператор (ЗП)».
+                        <span className="inline-flex items-center gap-1">
+                          <span aria-hidden>{opMeta.icon}</span>
+                          {cell || "\u00A0"}
                         </span>
                       ) : (
                         cell || "\u00A0"
