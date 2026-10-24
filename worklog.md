@@ -10,6 +10,25 @@
 > не уничтожал журнал.
 
 ---
+Task ID: 12
+Agent: main (Super Z, IM session)
+Task: boss — «maybe sly13 is excluded from build?:)» + root page (инлайнит /vipbikerental — по факту standalone): до загрузки палитры vip-bike страница серая, цветные слова в заголовках — прозрачные (скрин bad) или цветные квадраты на smart TV (до загрузки темы и после).
+
+Work Log:
+- /sly13 404 на проде: причина подтверждена — .vercelignore явно исключал app/sly13/ (и pavele0903/) как «large standalone non-rental app dir». Деплои были зелёные, страница просто не собиралась. Из .vercelignore убран app/sly13/ (pavele0903 оставлен исключённым). b6ece525 проверен как ancestor деплоя 52f5999 через GitHub status API.
+- Root = app/page.tsx (1387 строк, standalone client; /vipbikerental чист). Дефекты: (1) все --vip-* переменные ставились только в useEffect → до гидрации grayscale, а gradient-clip заголовков с несуществующими vars давал невалидный градиент + WebkitTextFillColor:transparent → слово-призрак (скрин bad: «VIP BIKE» без RENTAL); (2) TV WebKit: красит text-fill-color:transparent, но не умеет background-clip:text → градиент заливает ВЕСЬ span = цветные квадраты; плюс 35 color-mix() сайтов на TV невалидны → прозрачные шапки/оверлеи/секции.
+- Фиксы: (a) в <head> layout добавлен SSR <style id="vip-landing-vars"> — дефолты всех 25 --vip-* переменных (dark gold = то, что лендинг форсит на первом визите) красятся на FIRST paint, серости больше нет; (b) класс .vip-accent-clip в globals.css: дефолт — сплошной акцент, градиент-клип только внутри @supports ((-webkit-)background-clip:text); GradientText и hero-слово RENTAL переведены на него; (c) 35 color-mix заменены на предвычисленные rgba-переменные (--vip-accent-a5..a40, --vip-base-a25..a95, --vip-card-a30/a40, --vip-partners-bg) и hex-alpha суффиксы для tier/social литералов (#22C55E66 — стиль уже использовался в файле); (d) инжектор пересчитывает все тинты на каждый theme через новые withAlpha()/blendHex().
+- Аудит: каждый var(--vip-*) в page.tsx имеет SSR-дефолт + runtime override (скрипт-проверка 25/25); python-скрипт замен с отчётом по паттернам: 35 замен, 0 осталось.
+- Checks: tsc 0 ошибок (page/layout), next lint чисто, dev E2E: root 200, vip-landing-vars в <head>, 0 bg-clip-text / WebkitTextFillColor / color-mix в отданном HTML, 9 vip-accent-clip спанов, /sly13 200.
+- Пуш 845ac18 → main; Vercel перевыпуск подхватит и /sly13, и фикс лендинга.
+
+Stage Summary:
+- Загадка 404 /sly13 закрыта: сборка исключала каталог целиком, а не «отставала».
+- Лендинг: первый кадр сразу в палитре; акцентные слова читаемы везде (TV — сплошной цвет, современные — градиент); color-mix на странице нет вовсе.
+
+---
+
+---
 Task ID: 11
 Agent: main (Super Z, IM session)
 Task: fix docs/crewDocs/october-deposit-backfill-2026-10-22.sql (Paul: «ERROR 42804: COALESCE types text and integer cannot be matched» at line 37) + check/enhance the salavey13 page from the parallel agent (boss: «vip-bike crew is kinda test-first-real client… stats for season… counting one operator's commissions… sell app installations to others — some crews are preprepared»).
@@ -1151,3 +1170,64 @@ Work Log:
 
 Stage Summary:
 - 30-90 MB photos (48/200 MP modes, TG forwards) now decode → downscale → ship as ~200-500 KB JPEG on every compressed surface.
+
+---
+Task ID: 17-sly13-catalog-links
+Agent: main (Z.ai, IM session web-ebfeeaf7)
+Task: boss — fix links leading to catalog on /sly13: /franchize/sly13/catalog 404s, correct target is /franchize/sly13 (catalog is the default franchize view). Caution: parallel agent may have modified the page — merge carefully.
+
+Work Log:
+- Merge caution paid off: the page on main is the PARALLEL agent's 375-line version from 52f5999 (task 133) — NOT the b6ece525 version from task 11/15 (b6ece525 turned out to be a dangling commit, not an ancestor of main — the parallel lineage replaced it; its SQL money_to_num fix survived inside 52f5999, verified in docs/crewDocs/october-deposit-backfill-2026-10-22.sql). Worked strictly on top of the live version, zero content clobbered.
+- Root cause: no [slug]/catalog route exists under app/franchize/[slug]/ — and app/franchize/[slug]/page.tsx:29 defaults to the catalog tab (`isVipBikeRentalHost ? "rental" : "catalog"`), so /franchize/sly13 IS the catalog.
+- Fixed both CTAs in app/sly13/page.tsx: hero «Каталог услуг и запусков» (was L149) and services «Открыть каталог» (was L341) → /franchize/sly13 (+ comment why no /catalog subroute).
+- Link audit of the whole page: /franchize/vip-bike OK, /franchize/sly13/contacts OK (route exists), dynamic /franchize/${c.slug} OK, t.me external OK — only the two /catalog links were dead.
+- Verify: repo-wide rg — zero sly13/catalog refs left; typecheck:franchize slice PASS (16 pre-existing transitive debt files, sly13 not among them); eslint app/sly13/page.tsx 0 problems. (Full tsc --noEmit aborts OOM in this sandbox — exit 134, no TS diagnostics; scoped slice used instead.)
+- Committed → pull --rebase (no remote drift) → pushed 326c6c9 → main.
+
+Stage Summary:
+- /sly13 catalog CTAs now land on the live crew vitrina (/franchize/sly13) instead of a 404. Goes out with the next Vercel deploy (same one that ships the un-excluded /sly13 route itself).
+---
+Task ID: 112-sly13-service-images
+Agent: main (Claude)
+Task: generate artwork for sly13 crew's 7 service items (type=service), upload compressed to Supabase, assign in DB.
+
+Work Log:
+- Identified target: crew SLY13 (6be3846b) had 7 type=service items, ALL with empty image_url (no service item in the whole DB had images — sly13 sets the convention).
+- Service key recovered from /home/z/my-project/scripts/.sb_key (ref inmctohsodgdohamhzag).
+- Art direction: SLY13 CYBERVIBE brand — dark cyberpunk, neon cyan/violet, holographic UI, no text. 14 generations via z-ai CLI (portrait 768x1344 + landscape 1152x864 per item), resumable script scripts/gen-sly13-services.sh, 0 failures.
+- scripts/upload-sly13-service-images.mjs: sharp cover → image_1.jpg 720x1280 q82 mozjpeg (64-97 KB) + image_1_4x3.jpg 1080x810 (67-114 KB) → storage POST x-upsert → PATCH cars: image_url + specs.gallery=[2 urls], specs merge kept service/subtype/dailyPrice.
+- Verified: all 14 public URLs HTTP 200; all 7 rows show image_url + gallery=2 with specs intact; visual check of compressed card OK.
+- Originals kept in /home/z/my-project/download/sly13-services/<id>/{portrait,landscape}.png.
+
+Stage Summary:
+- sly13 services now have catalog cards: vibe-001 (аудит), vibe-002 (проектирование), setup-001/002 (запуск экипажа), edu-001/002 (обучение), mnt-001 (сопровождение).
+- Reusable: same two scripts can dress any crew's services (edit ITEMS + SUBJECTS).
+
+---
+Task ID: 135-moto-selection-images-sly13-notext
+Agent: main (Claude)
+Task: moto-selection services illustrated from /moto-selection landing copy + sly13 CJK-text images recreated.
+
+Work Log:
+- 8 moto-selection-svc-* rows had empty image_url. Catalog shows service cards aspect-square → image_1.jpg = 1080x1080 attention-crop + image_1_4x3.jpg 1080x810, mozjpeg q82 (61-174 KB).
+- Sources: 6 tildacdn photos from the /moto-selection landing (training→svc-01, pickUp→svc-02, hero→svc-05 аренда, storage→svc-06, detailing→svc-07, service→svc-08) + 2 generated photorealistic w/ #FF7522 accents (svc-03 эвакуация, svc-04 выездной осмотр — no photos on the original site).
+- sly13 audit: edu-002 (both) + mnt-001 landscape had Chinese hieroglyphs ("AI咨询…" / "高端AI咨询询服务卡" / "赛明克AI咨询服务卡") → regenerated no-text (text-hostile base, subjects kept), re-upserted + PATCHed. Backups: *.bad-text.png.
+- Verified 15/15: image_url + gallery[2], all URLs 200 image/*, specs (service/subtype/price) preserved.
+
+Stage Summary:
+- moto-selection = 2nd illustrated crew, first with real-photo cards; sly13 fully text-free.
+- Pipeline scripts committed: scripts/{dl-moto-landing-images.sh,gen-moto-selection-missing.sh,upload-moto-selection-service-images.mjs,gen-sly13-notext-fix.sh,upload-sly13-service-images.mjs,verify-service-images.mjs}. Same recipe fits vip-bike (44) — ~15 min per boss's estimate.
+
+---
+Task ID: 136-vipbike-48-talking-images
+Agent: main (Claude)
+Task: 48 vip-bike services illustrated with "talking" no-text images.
+
+Work Log:
+- 48 vip-bike-svc-* rows had no images. One hand-crafted "talking" subject per operation (what the service is = readable at a glance): chain lube, oil funnel, spark plug, brake pads, welding plow mount, fleet audit tablet, tick-mark clock (нормо-час) etc.
+- Style: dark premium workshop, cinematic photoreal, neon orange #FF7522 + violet glow; text-hostile base. gen-vipbike-services.sh resumable + 3 parallel workers; svc-001 clock-with-digits caught in audit and regenerated blank-face.
+- upload-vipbike-service-images.mjs: attention-crop 1080x1080 square (card) + 1080x810 4:3 (gallery), q82 → carpix upsert → PATCH image_url + specs.gallery (specs merged).
+- Verified 63/63 rows all crews: URLs 200 image/*, specs intact.
+
+Stage Summary:
+- vip-bike = 3rd illustrated crew; whole catalog's services now have images. Scripts: scripts/{gen-vipbike-services.sh,upload-vipbike-service-images.mjs,verify-service-images.mjs,inspect-vipbike.mjs}.

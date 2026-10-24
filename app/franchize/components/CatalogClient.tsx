@@ -1364,8 +1364,13 @@ export function CatalogClient({ crew, slug, items, mode = "rental", ctaPolicy }:
         {/* margin math: pt-2.5/-mt-2.5 and pb-2.5/mb-3.5 keep the visual gaps
             IDENTICAL to the old pt-0/pb-1/mb-5 (24px below, 20px above), while
             the extra padding lives INSIDE the scrollport so glow/rings survive
-            the overflow clip. */}
-        <div className="-mt-2.5 mb-3.5 flex min-w-0 max-w-full gap-2 overflow-x-auto [overflow-y:clip] [touch-action:pan-y_pan-x] overscroll-behavior-x-contain pb-2.5 pt-2.5 [&::-webkit-scrollbar]:h-1.5 [&::-webkit-scrollbar-track]:rounded-full [&::-webkit-scrollbar-track:bg-transparent] [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-current/20 [&::-webkit-scrollbar-thumb:hover]:bg-current/30" role="group" aria-label="Быстрые фильтры каталога">
+            the overflow clip. 2026-10-25 (boss, crew-header balloon fix): the
+            horizontal axis got the same treatment — the first pill («Все» is
+            active by default) had its 8px tier glow and 4px focus ring painted
+            past the scrollport's left padding edge and clipped. -mx-3/px-3 give
+            12px of scrollport room on both sides; the parent's px-4 absorbs the
+            negative margins, so the pills' visual position is unchanged. */}
+        <div className="-mx-3 -mt-2.5 mb-3.5 flex gap-2 overflow-x-auto px-3 [overflow-y:clip] [touch-action:pan-y_pan-x] overscroll-behavior-x-contain pb-2.5 pt-2.5 [&::-webkit-scrollbar]:h-1.5 [&::-webkit-scrollbar-track]:rounded-full [&::-webkit-scrollbar-track:bg-transparent] [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-current/20 [&::-webkit-scrollbar-thumb:hover]:bg-current/30" role="group" aria-label="Быстрые фильтры каталога">
           {QUICK_FILTERS.filter(f => {
             // In equipment mode, show equipment filters + "all"
             // In bike modes, show bike filters + "all"
@@ -1446,7 +1451,7 @@ export function CatalogClient({ crew, slug, items, mode = "rental", ctaPolicy }:
               <h2 className="text-2xl font-bold uppercase leading-tight tracking-tight text-[var(--catalog-text)]">Каталог готовых выездов</h2>
               <span className="inline-flex rounded-full bg-[var(--catalog-card-bg)] px-2.5 py-1 text-[11px] font-medium text-[var(--catalog-muted)]">синхронизируем наличие</span>
             </div>
-            <div className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-4">
+            <div className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-6 2xl:grid-cols-7">
               {[0, 1, 2, 3].map((index) => <CatalogCardSkeleton key={index} index={index} />)}
             </div>
           </section>
@@ -1612,7 +1617,10 @@ export function CatalogClient({ crew, slug, items, mode = "rental", ctaPolicy }:
 
                         {/* ── Info + CTA area (rentalbikes-style: highlight on hover, unified container to avoid gap) ── */}
                         {/* flex-1 + flex-col fills the card height so the hover border aligns. */}
-                        <div className="flex flex-1 flex-col rounded-b-2xl bg-[var(--catalog-card-bg)] p-3 transition-colors duration-300 group-hover:bg-[var(--catalog-accent)]">
+                        {/* task 133: no rounded-b-2xl — same reason as the grid card
+                            below (the accent hover fill must hug the card silhouette,
+                            not read as a narrower inner block). */}
+                        <div className="flex flex-1 flex-col bg-[var(--catalog-card-bg)] p-3 transition-colors duration-300 group-hover:bg-[var(--catalog-accent)]">
                           {/* Badges row */}
                           <div className="mb-1 flex flex-wrap gap-1">
                             {item.isHot && (
@@ -1695,7 +1703,7 @@ export function CatalogClient({ crew, slug, items, mode = "rental", ctaPolicy }:
                     </div>
                   </>
                 ) : (
-                <div className="grid grid-cols-2 gap-3 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 2xl:grid-cols-6">
+                <div className="grid grid-cols-2 gap-3 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-6 2xl:grid-cols-7">
                   {regularItems.map((item) => {
                     const rentalStrip = buildCatalogRentalStrip(item, crew);
                     const visibleSpecs = getVisibleSpecChips(item);
@@ -1757,8 +1765,14 @@ export function CatalogClient({ crew, slug, items, mode = "rental", ctaPolicy }:
                         {/* flex-1 + flex-col so this area grows to fill the card height (the
                             image is fixed aspect-[9/16]). Without this, shorter cards left a
                             gap between the content and the article border, so the hover border
-                            looked misaligned on shorter cards in a stretched grid/carousel row. */}
-                        <div className="flex flex-1 flex-col rounded-b-2xl bg-[var(--catalog-card-bg)] p-3 transition-colors duration-300 group-hover:bg-[var(--catalog-accent)]">
+                            looked misaligned on shorter cards in a stretched grid/carousel row.
+                            Task 133: NO rounded-b-2xl here — the article's rounded-2xl +
+                            overflow-hidden already clip this block to the card silhouette.
+                            The inner rounding made the accent hover fill read as a NARROWER
+                            block floating inside the card (dark corner bites + dark moat vs
+                            the framed image above) — on PC the boss read the highlighted
+                            card as literally smaller. */}
+                        <div className="flex flex-1 flex-col bg-[var(--catalog-card-bg)] p-3 transition-colors duration-300 group-hover:bg-[var(--catalog-accent)]">
                           {/* Badges row */}
                           <div className="mb-1 flex flex-wrap gap-1">
                             {item.isHot && (
