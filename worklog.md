@@ -1231,3 +1231,51 @@ Work Log:
 
 Stage Summary:
 - vip-bike = 3rd illustrated crew; whole catalog's services now have images. Scripts: scripts/{gen-vipbike-services.sh,upload-vipbike-service-images.mjs,verify-service-images.mjs,inspect-vipbike.mjs}.
+
+---
+Task ID: 18-nearest-hour-pickup-default
+Agent: main (Z.ai, IM session web-ebfeeaf7)
+Task: boss — «период аренды - время выдачи» in the item modal (main franchize catalog) defaults to 10am — default it to the nearest hour instead (13:40 → 14:00); date is already preset, just fix the time.
+
+Work Log:
+- New helper app/franchize/lib/date-utils.ts: nearestHourHhMm() — LOCAL wall clock rounded UP to the next flat hour (13:40→14:00, sharp 13:00 stays, 09:59→10:00); 23:xx clamps to 23:00 (start date is today, 00:00-tomorrow pickup would contradict it). Boundary matrix 8/8.
+- All FIVE default sites switched in CatalogClient.tsx: selectedOptions init (→ lazy useState initializer), openItem defaults, edit-cart-line fallback, ?vehicle= deep link, share-link ?startTime/?endTime prefill (end falls back to the START value so end<start stays impossible when URL has only startTime). start===end keeps «same datetime = 1 day minimum» pricing semantics.
+- Item.tsx modal fallback state: useState(nearestHourHhMm) ×2; pricing-math ||"10:00" fallbacks for CLEARED inputs left as-is (not initial defaults).
+- Env wiped again mid-task → re-cloned with PAT; node_modules absent → npm install (lockfile churn reverted before commit).
+- Verify: typecheck:franchize PASS (0 debt), lint:target PASS, 165 vitest tests across 9 suites (cart, promo, iter16, hotfix-string-prices, winter-storage, item-share, testdrive-flash, storage-wall, task133) PASS.
+- Committed ad9692f32 → pushed main (no remote drift).
+
+Stage Summary:
+- «Время выдачи» now opens at the nearest flat hour of the renter's watch; operator sees round slots on the sheet. Ships on next Vercel deploy.
+
+---
+Task ID: 19-rental-two-discounts-wheel-notify-pickers
+Agent: main (Z.ai, IM session web-ebfeeaf7)
+Task: boss — (1) поправь аренду order-mvnr3g9c-bz30mf: прошлые правки неверны, был ещё промокод WHEEL2000; итог 2 000 (1750+250), залог 20k, 22k на карту Т-Банка; + комментарий (друг субарендатора, распоряжение сверху, честный выигрыш колеса, «фото до» и одометр добавил сам). (2) Улучшить колесо-фортуны уведомления (поздравлятельнее, ник арендатора). (3) Робастный time-picker в модалке (white-on-white у арендатора).
+
+Work Log:
+- РАЗОБРАЛ МАТЕМАТИКУ: 5000 (4750 байк + 250 экип) − 2000 WHEEL2000 − 1000 вручную = 2000. Прошлая правка (параллельный агент) учла только −1000 → неверные 4000/24000.
+- SQL docs/crewDocs/rental-order-mvnr3g9c-bz30mf-two-discounts-2026-10-25.sql: dry-run + идемпотентный UPDATE (total_cost 2000, metadata merge: discount_rub 3000 + promo/manual разбивка + price_correction + operator_comment + payment_note; bike_price правится только если хранился). ЗАПУСК — руками boss'ом в Supabase SQL editor (в песочнице нет service key).
+- Wheel notify: resolveWheelWinnerDisplayName() (initData tg → users.full_name → users.username → сырой chat id последним — из-за tg:null у cookie-сессий в сводку улетал сырой id); сводка «@nick · Имя» + поздравительный тон + подсказка про кассу; DM победителю — «Поздравляем!» + нудж «крути ещё через 24ч». Получатели и так были верные (победитель + owner/admin/co_owner + ADMIN_CHAT_ID).
+- Item.tsx: openNativePicker (showPicker на клик по всему полю, try/catch) на 7 нативных инпутов (аренда ×4, сервис-запись, тест-драйв ×2) + fr-native-picker/fr-picker-{light,dark} классы; globals.css: ::-webkit-calendar-picker-indicator принудительный контраст через filter (сломанные WebKit не могут white-on-white).
+- Spéc +8 тестов (резолвер имён ×5, сводка ник+имя, дедуп имени, «Ура!»).
+- REBASE CONFLICT: параллельный task 138 (TV-safe landing gradients) тоже аппендил globals.css — разрешил (оба блока сохранены, braces 306/306 balanced), ребейз прошёл, пуш 3b23457a4.
+- Verify: typecheck:franchize PASS, lint:target PASS, vitest 21 wheel + 52 regression PASS.
+
+Stage Summary:
+- Код в main (3b23457a4). SQL-правку аренды boss вставляет в Supabase SQL editor: dry-run → BEGIN…COMMIT → post-check (ожидает total_cost 2000, card_total 22000, bike_price 1750).
+
+---
+Task ID: 20-rental-applied-sql-doc-retired
+Agent: main (Z.ai, IM session web-ebfeeaf7)
+Task: boss — «update rental yourself:) and ditch this sql from docs» — применить правку order-mvnr3g9c-bz30mf напрямую в Supabase (service key выдан) и удалить docs/crewDocs/rental-order-mvnr3g9c-bz30mf-two-discounts-2026-10-25.sql.
+
+Work Log:
+- Supabase PostgREST (service_role): GET rentals по metadata->>order_id — ровно 1 строка (rental_id 1a1c1b3c…), renter_name «Затонский Сергей», guard на deposit=20000. BEFORE подтвердил неверную прошлую правку: total_cost 4000, discount_rub 1000, payment_split.bank 24000.
+- PATCH по PK (script /home/z/my-project/scripts/fix-rental-two-discounts.mjs, dry-run → --apply): total_cost 2000; metadata merge — discount_rub 3000, promo_code WHEEL2000 (−2000), manual_discount_rub 1000 + reason, price_correction (5000→2000, 1750+250), operator_comment (друг субарендатора, распоряжение сверху, честный выигрыш колеса, «фото до» + одометр сам, оплачено 22 000 tbank, договор со старой суммой), payment_note, corrected_at/by. Плюс консистентность полей, которые SQL-док оставлял устаревшими: price_override_amount 4000→2000, payment_split.bank 24000→22000, price_adjustment {discount 3000, new_total 2000}.
+- bike_price/equipment_price в metadata НЕ хранились → сплит 1750+250 задокументирован в price_correction/operator_comment (как и предусматривал CASE в SQL-доке).
+- POST-CHECK перечитыванием: total_cost 2000, deposit 20000, card 22000, скидки −2000 промо + −1000 вручную, payment_split.bank 22000, комментарий на месте — все ожидания сошлись.
+- docs/crewDocs/rental-order-mvnr3g9c-bz30mf-two-discounts-2026-10-25.sql удалён (git rm) — правка применена, SQL-док больше не нужен. Код task 19 (wheel congrats + пикеры) проверен: в main, local == origin.
+
+Stage Summary:
+- Аренда order-mvnr3g9c-bz30mf в БД приведена к реальности: 2 000 ₽ аренда (1 750 + 250) + 20 000 залог = 22 000 ₽ на карте Т-Банка; два скидочных следа (промо WHEEL2000 −2 000 + ручная −1 000) и комментарий для операторов в metadata. SQL-док вычищен из docs.
